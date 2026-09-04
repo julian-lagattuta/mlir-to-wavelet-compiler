@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 use wavelet_elab::{
-    Expr, Op, Program, Stmt, Tail, UntypedVar,
+    Expr, Op, Program, Stmt, Tail,
+    ir::Variable,
     logic::{
         region::{Interval, Region},
         semantic::solver::Idx,
     },
 };
 
-pub(crate) fn rename_program_variables(program: &mut Program<UntypedVar>) {
+pub(crate) fn rename_program_variables<V: Variable>(program: &mut Program<V>) {
     for definition in &mut program.defs {
         let mut renamer = VariableRenamer::default();
 
@@ -55,18 +56,18 @@ impl VariableRenamer {
         renamed
     }
 
-    fn rename_var(&mut self, variable: &mut UntypedVar) {
-        variable.0 = self.rename_name(&variable.0);
+    fn rename_var<V: Variable>(&mut self, variable: &mut V) {
+        *variable = variable.rename(self.rename_name(variable.name()));
     }
 
-    fn rename_expr(&mut self, expression: &mut Expr<UntypedVar>) {
+    fn rename_expr<V: Variable>(&mut self, expression: &mut Expr<V>) {
         for statement in &mut expression.stmts {
             self.rename_stmt(statement);
         }
         self.rename_tail(&mut expression.tail);
     }
 
-    fn rename_stmt(&mut self, statement: &mut Stmt<UntypedVar>) {
+    fn rename_stmt<V: Variable>(&mut self, statement: &mut Stmt<V>) {
         match statement {
             Stmt::LetVal { var, .. } => self.rename_var(var),
             Stmt::LetOp { vars, op, .. } => {
@@ -86,7 +87,7 @@ impl VariableRenamer {
         }
     }
 
-    fn rename_op(&mut self, operation: &mut Op<UntypedVar>) {
+    fn rename_op<V: Variable>(&mut self, operation: &mut Op<V>) {
         match operation {
             Op::Load { array, index, .. } => {
                 self.rename_var(array);
@@ -106,7 +107,7 @@ impl VariableRenamer {
         }
     }
 
-    fn rename_tail(&mut self, tail: &mut Tail<UntypedVar>) {
+    fn rename_tail<V: Variable>(&mut self, tail: &mut Tail<V>) {
         match tail {
             Tail::RetVar(variable) => self.rename_var(variable),
             Tail::IfElse {
@@ -131,10 +132,7 @@ impl VariableRenamer {
             region
                 .iter()
                 .map(|interval| {
-                    Interval::bounded(
-                        self.rename_idx(&interval.lo),
-                        self.rename_idx(&interval.hi),
-                    )
+                    Interval::bounded(self.rename_idx(&interval.lo), self.rename_idx(&interval.hi))
                 })
                 .collect(),
         )
@@ -165,11 +163,7 @@ mod tests {
     use wavelet_elab::{
         Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar,
         ir::{ArrayLen, Signedness},
-        logic::{
-            cap::CapPattern,
-            region::Region,
-            semantic::solver::Idx,
-        },
+        logic::{cap::CapPattern, region::Region, semantic::solver::Idx},
     };
 
     use super::rename_program_variables;
@@ -228,7 +222,13 @@ mod tests {
         assert_eq!(definition.params[1].name, "arg1");
         assert_eq!(definition.alloc_arrays, ["arg0"]);
         assert_eq!(definition.caps[0].array, "arg0");
-        let interval = definition.caps[0].shrd.as_ref().unwrap().iter().next().unwrap();
+        let interval = definition.caps[0]
+            .shrd
+            .as_ref()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
         assert_eq!(interval.lo, Idx::Var("arg1".to_string()));
         let Stmt::LetOp { vars, op, .. } = &definition.body.stmts[0] else {
             unreachable!()
@@ -239,6 +239,44 @@ mod tests {
         };
         assert_eq!(array.0, "arg0");
         assert_eq!(index.0, "arg1");
-        assert_eq!(definition.body.tail, Tail::RetVar(UntypedVar("v0".to_string())));
+        assert_eq!(
+            definition.body.tail,
+            Tail::RetVar(UntypedVar("v0".to_string()))
+        );
+    }
+
+    #[test]
+    fn renames_typed_variables_without_changing_their_types() {
+        let int_ty = Ty::Int(Signedness::Signed);
+        let mut program = Program {
+            defs: vec![FnDef {
+                name: wavelet_elab::FnName("typed".to_string()),
+                params: vec![TypedVar::new("old_parameter", int_ty.clone())],
+                alloc_arrays: vec![],
+                caps: vec![],
+                returns: int_ty.clone(),
+                body: Expr {
+                    stmts: vec![Stmt::LetVal {
+                        var: TypedVar::new("old_local", int_ty.clone()),
+                        val: wavelet_elab::Val::Int(-1),
+                        fence: false,
+                    }],
+                    tail: Tail::RetVar(TypedVar::new("old_local", int_ty.clone())),
+                },
+            }],
+        };
+
+        rename_program_variables(&mut program);
+
+        let definition = &program.defs[0];
+        assert_eq!(definition.params[0], TypedVar::new("arg0", int_ty.clone()));
+        let Stmt::LetVal { var, .. } = &definition.body.stmts[0] else {
+            unreachable!()
+        };
+        assert_eq!(var, &TypedVar::new("v0", int_ty.clone()));
+        assert_eq!(
+            definition.body.tail,
+            Tail::RetVar(TypedVar::new("v0", int_ty))
+        );
     }
 }

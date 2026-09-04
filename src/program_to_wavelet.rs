@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
 use wavelet_elab::{
-    ir::{ArrayLen, Signedness},
+    Expr, FnDef, Op, Program, Stmt, Tail, Ty, Val,
+    ir::{ArrayLen, Signedness, Variable},
     logic::{cap::CapPattern, region::Region, semantic::solver::Idx},
-    Expr, FnDef, Op, Program, Stmt, Tail, Ty, UntypedVar, Val,
 };
 
-pub fn program_to_wavelet(program: &Program<UntypedVar>) -> String {
+pub fn program_to_wavelet<V: Variable>(program: &Program<V>) -> String {
     let mut output = String::new();
 
     for (index, definition) in program.defs.iter().enumerate() {
@@ -19,7 +19,7 @@ pub fn program_to_wavelet(program: &Program<UntypedVar>) -> String {
     output
 }
 
-fn write_fn(output: &mut String, definition: &FnDef<UntypedVar>) {
+fn write_fn<V: Variable>(output: &mut String, definition: &FnDef<V>) {
     if !definition.caps.is_empty() {
         output.push_str("#[cap(");
         let mut first = true;
@@ -209,7 +209,7 @@ fn write_idx_with_parentheses(output: &mut String, index: &Idx) {
     }
 }
 
-fn write_expr(output: &mut String, expression: &Expr<UntypedVar>, depth: usize) {
+fn write_expr<V: Variable>(output: &mut String, expression: &Expr<V>, depth: usize) {
     for statement in &expression.stmts {
         indent(output, depth);
         write_stmt(output, statement);
@@ -225,11 +225,11 @@ fn write_expr(output: &mut String, expression: &Expr<UntypedVar>, depth: usize) 
     output.push('\n');
 }
 
-fn write_stmt(output: &mut String, statement: &Stmt<UntypedVar>) {
+fn write_stmt<V: Variable>(output: &mut String, statement: &Stmt<V>) {
     match statement {
         Stmt::LetVal { var, val, .. } => {
             output.push_str("let ");
-            output.push_str(&var.0);
+            output.push_str(var.name());
             output.push_str(" = ");
             write_val(output, val);
             output.push(';');
@@ -240,7 +240,7 @@ fn write_stmt(output: &mut String, statement: &Stmt<UntypedVar>) {
         } => {
             if let Some(var) = vars.first() {
                 output.push_str("let ");
-                output.push_str(&var.0);
+                output.push_str(var.name());
                 output.push_str(" = ");
             }
             write_call(output, &func.0, args);
@@ -249,15 +249,15 @@ fn write_stmt(output: &mut String, statement: &Stmt<UntypedVar>) {
     }
 }
 
-fn write_op(output: &mut String, vars: &[UntypedVar], op: &Op<UntypedVar>) {
+fn write_op<V: Variable>(output: &mut String, vars: &[V], op: &Op<V>) {
     match op {
         Op::Load { array, index, .. } => {
             output.push_str("let ");
-            output.push_str(&vars[0].0);
+            output.push_str(vars[0].name());
             output.push_str(" = ");
-            output.push_str(&array.0);
+            output.push_str(array.name());
             output.push('[');
-            output.push_str(&index.0);
+            output.push_str(index.name());
             output.push_str("];");
         }
         Op::Store {
@@ -266,35 +266,35 @@ fn write_op(output: &mut String, vars: &[UntypedVar], op: &Op<UntypedVar>) {
             value,
             ..
         } => {
-            output.push_str(&array.0);
+            output.push_str(array.name());
             output.push('[');
-            output.push_str(&index.0);
+            output.push_str(index.name());
             output.push_str("] = ");
-            output.push_str(&value.0);
+            output.push_str(value.name());
             output.push(';');
         }
         Op::Not => {
             output.push_str("let ");
-            output.push_str(&vars[1].0);
+            output.push_str(vars[1].name());
             output.push_str(" = !");
-            output.push_str(&vars[0].0);
+            output.push_str(vars[0].name());
             output.push(';');
         }
         _ => {
             output.push_str("let ");
-            output.push_str(&vars[2].0);
+            output.push_str(vars[2].name());
             output.push_str(" = ");
-            output.push_str(&vars[0].0);
+            output.push_str(vars[0].name());
             output.push(' ');
             output.push_str(binary_operator(op));
             output.push(' ');
-            output.push_str(&vars[1].0);
+            output.push_str(vars[1].name());
             output.push(';');
         }
     }
 }
 
-fn binary_operator(op: &Op<UntypedVar>) -> &'static str {
+fn binary_operator<V>(op: &Op<V>) -> &'static str {
     match op {
         Op::Add => "+",
         Op::Sub => "-",
@@ -315,9 +315,9 @@ fn binary_operator(op: &Op<UntypedVar>) -> &'static str {
     }
 }
 
-fn write_tail(output: &mut String, tail: &Tail<UntypedVar>, depth: usize) {
+fn write_tail<V: Variable>(output: &mut String, tail: &Tail<V>, depth: usize) {
     match tail {
-        Tail::RetVar(var) => output.push_str(&var.0),
+        Tail::RetVar(var) => output.push_str(var.name()),
         Tail::TailCall { func, args } => write_call(output, &func.0, args),
         Tail::IfElse {
             cond,
@@ -325,7 +325,7 @@ fn write_tail(output: &mut String, tail: &Tail<UntypedVar>, depth: usize) {
             else_e,
         } => {
             output.push_str("if ");
-            output.push_str(&cond.0);
+            output.push_str(cond.name());
             output.push_str(" {\n");
             write_expr(output, then_e, depth + 1);
             indent(output, depth);
@@ -337,14 +337,14 @@ fn write_tail(output: &mut String, tail: &Tail<UntypedVar>, depth: usize) {
     }
 }
 
-fn write_call(output: &mut String, function: &str, args: &[UntypedVar]) {
+fn write_call<V: Variable>(output: &mut String, function: &str, args: &[V]) {
     output.push_str(function);
     output.push('(');
     for (index, arg) in args.iter().enumerate() {
         if index != 0 {
             output.push_str(", ");
         }
-        output.push_str(&arg.0);
+        output.push_str(arg.name());
     }
     output.push(')');
 }
@@ -357,7 +357,7 @@ fn write_val(output: &mut String, value: &Val) {
     }
 }
 
-fn stmt_is_fenced(statement: &Stmt<UntypedVar>) -> bool {
+fn stmt_is_fenced<V>(statement: &Stmt<V>) -> bool {
     match statement {
         Stmt::LetVal { fence, .. } | Stmt::LetOp { fence, .. } | Stmt::LetCall { fence, .. } => {
             *fence
@@ -365,7 +365,7 @@ fn stmt_is_fenced(statement: &Stmt<UntypedVar>) -> bool {
     }
 }
 
-fn const_generics(definition: &FnDef<UntypedVar>) -> Vec<String> {
+fn const_generics<V>(definition: &FnDef<V>) -> Vec<String> {
     let mut used_in_lengths = HashSet::new();
     for parameter in &definition.params {
         match &parameter.ty {
@@ -418,7 +418,10 @@ fn indent(output: &mut String, depth: usize) {
 
 #[cfg(test)]
 mod tests {
-    use wavelet_elab::{logic::semantic::solver::Idx, parse_program};
+    use wavelet_elab::{
+        Expr, FnDef, FnName, Program, Stmt, Tail, Ty, TypedVar, Val, ir::Signedness,
+        logic::semantic::solver::Idx, parse_program,
+    };
 
     use super::{program_to_wavelet, write_idx};
 
@@ -449,6 +452,36 @@ mod tests {
         let program = parse_program(source).unwrap();
         let serialized = program_to_wavelet(&program);
 
+        parse_program(&serialized).unwrap();
+    }
+
+    #[test]
+    fn serializes_typed_programs() {
+        let int_ty = Ty::Int(Signedness::Signed);
+        let program = Program {
+            defs: vec![FnDef {
+                name: FnName("typed".to_string()),
+                params: vec![],
+                alloc_arrays: vec![],
+                caps: vec![],
+                returns: int_ty.clone(),
+                body: Expr {
+                    stmts: vec![Stmt::LetVal {
+                        var: TypedVar::new("value", int_ty.clone()),
+                        val: Val::Int(-1),
+                        fence: false,
+                    }],
+                    tail: Tail::RetVar(TypedVar::new("value", int_ty)),
+                },
+            }],
+        };
+
+        let serialized = program_to_wavelet(&program);
+
+        assert_eq!(
+            serialized,
+            "fn typed() -> i32 {\n    let value = -1;\n    value\n}\n"
+        );
         parse_program(&serialized).unwrap();
     }
 }

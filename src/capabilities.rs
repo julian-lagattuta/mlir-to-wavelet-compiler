@@ -684,6 +684,7 @@ where 'c: 'a
         hashmap.extend(map);
         hashmap.insert(func.to_raw().ptr, coalesce_capabilities(caps));
     }
+    capability_constants(&mut hashmap);
     hashmap
 }
 pub(super) fn block_capabilities<'c, 'a, 'b>(
@@ -1073,7 +1074,7 @@ pub(super) fn coalesce_pair<'c, 'a>(
     let uniq_ends_after = solver_proves(&solver, &shrd_end.le(&uniq_end));
     let shrd_ends_after = solver_proves(&solver, &uniq_end.le(&shrd_end));
     let array = shrd.array;
-
+    println!("{} {} {} {} {} {}", shrd, uniq,uniq_starts_before,shrd_starts_before,uniq_ends_after,shrd_ends_after);
     match (
         uniq_starts_before,
         shrd_starts_before,

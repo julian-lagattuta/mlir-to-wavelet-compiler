@@ -11,14 +11,29 @@ mod util;
 mod fence_placement;
 mod program_to_wavelet;
 mod rename_variables;
+mod type_program;
 use capabilities::print_return_expressions;
 use wavelet_elab::{Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
 use crate::{capabilities::{Capability, capability_constants, compute_capabilities, constant_fold_value, generate_expr, to_wavelet_capability}, program_to_wavelet::program_to_wavelet, rename_variables::rename_program_variables, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
-fn scf_to_wavelet<'c>(module: Module<'c>) -> Option<Program<UntypedVar>> {
-    todo!("ds");
-    None
+fn module_to_wavelet<'c>(module: Module<'c>) -> Program<TypedVar> {
+    let moduleref = module.as_operation();
+    let mut untyped_program = Program { defs: Vec::new() };
+
+    let Some(block) = moduleref.first_region().unwrap().first_block() else {
+        return Program{defs: Default::default()};
+    };
+    let capability_map = compute_capabilities(&module);
+    for func in BlockIter::new(block){
+        function_to_wavelet(func, &mut untyped_program, &capability_map);
+    }
+    let mut program = type_program::type_program(&untyped_program).unwrap();
+    rename_program_variables(&mut program);
+    
+    fence_placement::place_fences(&mut program);
+    program
 }
+
 
 const generator: FreshWaveletNames = FreshWaveletNames::new();
 fn operation_to_wavelet<'c, 'a>(
@@ -320,7 +335,7 @@ fn find_free_variables<'c, 'a>(block: BlockRef<'c, 'a>) -> Vec<Value<'c, 'a>> {
     free_variables
 }
 
-fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, func_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>){
+fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, func_map: &HashMap<* mut c_void, Vec<Capability<'c, 'a>>>){
     let block = func.region(0).unwrap().first_block().unwrap();
     let alias_information = block.first_operation();
     let mut arguments = Vec::new();
@@ -514,7 +529,7 @@ fn for_loop_function_captures<'c, 'a>(
 fn if_to_wavelet<'c, 'a>(
     if_statement: OperationRef<'c, 'a>,
     program: &mut Program<UntypedVar>,
-    cap_map: &mut HashMap<*mut c_void, Vec<Capability<'c, 'a>>>,
+    cap_map: &HashMap<*mut c_void, Vec<Capability<'c, 'a>>>,
 ) -> Stmt<UntypedVar> {
     assert!(
         if_statement.result_count() <= 1,
@@ -596,7 +611,7 @@ fn if_to_wavelet<'c, 'a>(
         fence: false,
     }
 }
-fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Stmt<UntypedVar>{
+fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: &HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Stmt<UntypedVar>{
     let block = for_loop
         .first_region()
         .unwrap()
@@ -740,7 +755,7 @@ fn block_to_wavelet<'c, 'a>(
     block: BlockRef<'c, 'a>,
     program: &mut Program<UntypedVar>,
     tail_call: Option<&TailCallInformation>,
-    cap_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>
+    cap_map: &HashMap<* mut c_void, Vec<Capability<'c, 'a>>>
 ) -> wavelet_elab::Expr<UntypedVar>{
     let mut stmts = Vec::new();
     let mut tail = None;
@@ -873,18 +888,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // print_return_expressions(&module);
     // loop_unswitching::loop_unswitch(&context, &mut module);
-    let mut program = Program { defs: Vec::new() };
-    let mut func = module.as_operation().first_region().unwrap().first_block().unwrap().first_operation().unwrap();
-    let mut cap_map = compute_capabilities(&module);
-    capability_constants(&mut cap_map);
-    function_to_wavelet(func, &mut program, &mut cap_map);
-    rename_program_variables(&mut program);
+    // let mut program = Program { defs: Vec::new() };
+    // let mut func = module.as_operation().first_region().unwrap().first_block().unwrap().first_operation().unwrap();
+    // let mut cap_map = compute_capabilities(&module);
+    // capability_constants(&mut cap_map);
+    // function_to_wavelet(func, &mut program, &cap_map);
+    // rename_program_variables(&mut program);
 
+    let mut wavelet_program = module_to_wavelet(module);
+    let output_program = program_to_wavelet(&wavelet_program);
 
-    fs::write(output_path, program_to_wavelet(&program))?;
-    if !module.as_operation().verify() {
-        println!("failed to verify");
-    }
+    fs::write(output_path, output_program)?;
+    // if !module.as_operation().verify() {
+    //     println!("failed to verify");
+    // }
     Ok(())
 }
 

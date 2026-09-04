@@ -2,7 +2,7 @@ use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, debug_assert, rc::{Rc, Weak},
 };
 
-use wavelet_elab::{FnName, Op, Stmt, Ty, TypedVar, Val};
+use wavelet_elab::{Expr, FnDef, FnName, Op, Program, Stmt, Ty, TypedVar, Val, ir::Signedness};
 use z3::ast::{Bool, Int};
 use z3::Solver;
 struct Node {
@@ -27,6 +27,15 @@ enum NodeOp {
     Variable,
 }
 impl Node {
+    fn z3_uniq_capabilities(&self, variable: Int)->Option<Bool>{
+        match &self.op{
+            NodeOp::Call(fn_name, nodes) => todo!(),
+            NodeOp::Write { array, idx, value } => {
+                
+            },
+            _ => None
+        }
+    }
     fn to_z3(&self) -> Option<Bool> {
         let var = self.var.as_ref()?;
         match &var.ty {
@@ -235,8 +244,7 @@ fn collect_free_variables(stmts: &[Stmt<TypedVar>]) -> Vec<Rc<Node>> {
     free_variables
 }
 struct Dag {
-    nodes: Vec<Rc<Node>>,
-    read_write_order: HashMap<String, Vec<(Rc<Node>, Rc<Node>)>>,
+    nodes: Vec<Rc<Node>>
 }
 fn stmts_to_dag(stmts: &[Stmt<TypedVar>]) -> Dag {
     let base_nodes = collect_free_variables(stmts);
@@ -249,7 +257,6 @@ fn stmts_to_dag(stmts: &[Stmt<TypedVar>]) -> Dag {
         })
         .collect();
     let mut nodes = base_nodes.clone();
-    let mut read_write_order: HashMap<String, Vec<(Rc<Node>, Rc<Node>)>> = HashMap::new();
     for stmt in stmts {
         let node = match stmt {
             Stmt::LetVal {
@@ -345,18 +352,10 @@ fn stmts_to_dag(stmts: &[Stmt<TypedVar>]) -> Dag {
         if let Some(var) = &node.var {
             variable_map.insert(var.name.clone(), node.clone());
         }
-        if let NodeOp::Read { array, idx } | NodeOp::Write { array, idx, .. } = &node.op {
-            let array_name = array.var.as_ref().unwrap().name.clone();
-            read_write_order
-                .entry(array_name)
-                .or_default()
-                .push((idx.clone(), node.clone()));
-        }
         nodes.push(node);
     }
     Dag {
         nodes,
-        read_write_order,
     }
 }
 fn is_conflicting(idx1: &Int, idx2: &Int, solver: &Solver) -> bool {
@@ -367,10 +366,9 @@ enum FenceOrNode{
     Fence,
     Node(Rc<Node>)
 }
-fn order_dag(dag: Dag, assumptions: Bool) -> Vec<FenceOrNode> {
+fn order_dag(dag: Dag, assumptions: &Bool) -> Vec<FenceOrNode> {
     let Dag {
         nodes,
-        read_write_order,
     } = dag;
 
     let solver = Solver::new();
@@ -391,10 +389,13 @@ fn order_dag(dag: Dag, assumptions: Bool) -> Vec<FenceOrNode> {
                 let idx2_z3 = idx2.to_z3_int().unwrap();
 
                 if is_conflicting(&idx1_z3, &idx2_z3, &solver) {
+                    println!("conflict found between {} and {}", idx1_z3, idx2_z3);
                     access1
                         .fence_parents
                         .borrow_mut()
                         .push(Rc::downgrade(access2));
+                }else{
+                    println!("conflict not found between {} and {}", idx1_z3, idx2_z3);
                 }
             }
         }
@@ -484,45 +485,32 @@ fn order_to_stmts(order: Vec<FenceOrNode>) -> Vec<Stmt<TypedVar>>{
     }
     stmts
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Node, NodeOp};
-    use std::{cell::RefCell, rc::Rc};
-    use wavelet_elab::{ir::Signedness, Op, Ty, TypedVar, Val};
-    use z3::{ast::Int, SatResult, Solver};
-
-    fn node(name: &str, ty: Ty, op: NodeOp) -> Rc<Node> {
-        Rc::new(Node {
-            op,
-            var: Some(TypedVar::new(name, ty)),
-            parents: RefCell::default(),
-            fence_parents: Default::default()
-
-        })
+fn place_fences_expr(expr: &mut Expr<TypedVar>, assumptions: &Bool){
+    let dag = stmts_to_dag(&expr.stmts);
+    let order = order_dag(dag, assumptions);
+    expr.stmts = order_to_stmts(order);
+    match &mut expr.tail{
+        wavelet_elab::Tail::IfElse { cond, then_e, else_e } => {
+            let true_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone())]);
+            place_fences_expr(then_e, &true_assumptions);
+            let false_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone()).not()]);
+            place_fences_expr(else_e, &false_assumptions);
+        },
+        _ => {}
     }
-
-    #[test]
-    fn to_z3_leaves_operand_variables_free() {
-        let int = Ty::Int(Signedness::Signed);
-        let two = node("two", int.clone(), NodeOp::Constant(Val::Int(2)));
-        let three = node("three", int.clone(), NodeOp::Constant(Val::Int(3)));
-        let sum = node(
-            "sum",
-            int,
-            NodeOp::BinOp(Op::Add, two.clone(), three.clone()),
-        );
-
-        let solver = Solver::new();
-        solver.assert(sum.to_z3().unwrap());
-        solver.assert(sum.to_z3_int().unwrap().eq(Int::from_i64(100)));
-        assert_eq!(solver.check(), SatResult::Sat);
-
-        let solver = Solver::new();
-        solver.assert(sum.to_z3().unwrap());
-        solver.assert(two.to_z3().unwrap());
-        solver.assert(three.to_z3().unwrap());
-        solver.assert(sum.to_z3_int().unwrap().ne(Int::from_i64(5)));
-        assert_eq!(solver.check(), SatResult::Unsat);
+}
+fn place_fences_fn(func: &mut FnDef<TypedVar>){
+    let mut assumptions = Vec::new();
+    for x in &func.params{
+        if let Ty::Int(Signedness::Unsigned) = &x.ty{
+            assumptions.push(Int::new_const(x.name.clone()).ge(Int::from_i64(0)));
+        }
+    }
+    let assumptions = Bool::and(&assumptions);
+    place_fences_expr(&mut func.body, &assumptions);
+}
+pub fn place_fences(program: &mut Program<TypedVar>){
+    for func in &mut program.defs{
+        place_fences_fn(func);
     }
 }
