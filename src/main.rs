@@ -21,7 +21,9 @@ fn module_to_wavelet<'c>(module: Module<'c>) -> Program<TypedVar> {
     let mut untyped_program = Program { defs: Vec::new() };
 
     let Some(block) = moduleref.first_region().unwrap().first_block() else {
-        return Program{defs: Default::default()};
+        return Program{
+            defs: Default::default()
+        };
     };
     let capability_map = compute_capabilities(&module);
     for func in BlockIter::new(block){

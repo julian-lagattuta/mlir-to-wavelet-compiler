@@ -70,7 +70,10 @@ mod implementation {
     }
 
     fn ordered_labels(stmts: &[Stmt<TypedVar>]) -> Vec<String> {
-        order_dag(stmts_to_dag(stmts), Bool::from_bool(true))
+        order_dag(
+            stmts_to_dag(stmts, &HashMap::new()),
+            Bool::from_bool(true),
+        )
             .into_iter()
             .map(|item| match item {
                 FenceOrNode::Fence => "fence".to_owned(),

@@ -2,9 +2,24 @@ use std::{
     cell::RefCell, collections::{HashMap, HashSet, VecDeque}, debug_assert, rc::{Rc, Weak},
 };
 
-use wavelet_elab::{Expr, FnDef, FnName, Op, Program, Stmt, Ty, TypedVar, Val, ir::Signedness};
-use z3::ast::{Bool, Int};
+use wavelet_elab::{
+    Expr, FnDef, FnName, Op, Program, Stmt, Ty, TypedVar, Val, ir::Signedness, logic::{cap::CapPattern, semantic::Idx},
+};
+use z3::{SatResult, ast::{Bool, Int}};
 use z3::Solver;
+
+use crate::capabilities::CapabilityType::{self, Shrd, Uniq};
+
+fn idx_to_z3(idx: &Idx) -> Int {
+    match idx {
+        Idx::Const(value) => Int::from_i64(*value),
+        Idx::Var(name) => Int::new_const(name.clone()),
+        Idx::Add(lhs, rhs) => Int::add(&[&idx_to_z3(lhs), &idx_to_z3(rhs)]),
+        Idx::Sub(lhs, rhs) => Int::sub(&[&idx_to_z3(lhs), &idx_to_z3(rhs)]),
+        Idx::Mul(lhs, rhs) => Int::mul(&[&idx_to_z3(lhs), &idx_to_z3(rhs)]),
+    }
+}
+
 struct Node {
     op: NodeOp,
     var: Option<TypedVar>,
@@ -27,11 +42,46 @@ enum NodeOp {
     Variable,
 }
 impl Node {
-    fn z3_uniq_capabilities(&self, variable: Int)->Option<Bool>{
+    fn z3_capabilities(&self, cap_type: CapabilityType,array_name: &String,variable: &Int, functions: &HashMap<String, FnDef<TypedVar>>)->Option<Bool>{
         match &self.op{
-            NodeOp::Call(fn_name, nodes) => todo!(),
+            NodeOp::Call(fn_name, nodes) => {
+                let fndef =functions.get(&fn_name.0).unwrap();
+                let mut props = Vec::new();
+                for cap in fndef.caps.iter(){
+                    if &cap.array != array_name{
+                        continue;
+                    }
+                    
+                    let Some(uniq) = (match cap_type{
+                        CapabilityType::Shrd => &cap.shrd,
+                        CapabilityType::Uniq => &cap.uniq,
+                    }) else {continue};
+                    for interval in uniq.iter(){
+                        props.push(Bool::and(&[
+                            variable.ge(idx_to_z3(&interval.lo)),
+                            variable.lt(idx_to_z3(&interval.hi))
+                        ]));
+                    }
+                }
+                Some(Bool::or(&props))
+            },
             NodeOp::Write { array, idx, value } => {
-                
+                if cap_type == CapabilityType::Shrd{
+                    return None
+                }
+                if &array.var.as_ref().unwrap().name != array_name{
+                    return None;
+                }
+                Some(variable.eq(idx.to_z3_int().unwrap()))
+            },
+            NodeOp::Read { array, idx } => {
+                if cap_type == CapabilityType::Uniq{
+                    return None
+                }
+                if &array.var.as_ref().unwrap().name != array_name{
+                    return None;
+                }
+                Some(variable.eq(idx.to_z3_int().unwrap()))
             },
             _ => None
         }
@@ -244,9 +294,13 @@ fn collect_free_variables(stmts: &[Stmt<TypedVar>]) -> Vec<Rc<Node>> {
     free_variables
 }
 struct Dag {
-    nodes: Vec<Rc<Node>>
+    nodes: Vec<Rc<Node>>,
+    read_write_order: HashMap<String, Vec<Rc<Node>>>,
 }
-fn stmts_to_dag(stmts: &[Stmt<TypedVar>]) -> Dag {
+fn stmts_to_dag(
+    stmts: &[Stmt<TypedVar>],
+    functions: &HashMap<String, FnDef<TypedVar>>,
+) -> Dag {
     let base_nodes = collect_free_variables(stmts);
     let mut variable_map: HashMap<String, Rc<Node>> = base_nodes
         .iter()
@@ -257,6 +311,7 @@ fn stmts_to_dag(stmts: &[Stmt<TypedVar>]) -> Dag {
         })
         .collect();
     let mut nodes = base_nodes.clone();
+    let mut read_write_order: HashMap<String, Vec<Rc<Node>>> = HashMap::new();
     for stmt in stmts {
         let node = match stmt {
             Stmt::LetVal {
@@ -352,54 +407,123 @@ fn stmts_to_dag(stmts: &[Stmt<TypedVar>]) -> Dag {
         if let Some(var) = &node.var {
             variable_map.insert(var.name.clone(), node.clone());
         }
+        match &node.op {
+            NodeOp::Read { array, .. } | NodeOp::Write { array, .. } => {
+                let array_name = array.var.as_ref().unwrap().name.clone();
+                read_write_order
+                    .entry(array_name)
+                    .or_default()
+                    .push(node.clone());
+            }
+            NodeOp::Call(function_name, arguments) => {
+                let function = functions.get(&function_name.0).unwrap();
+                let mut seen_arrays = HashSet::new();
+                for capability in &function.caps {
+                    let parameter_index = function
+                        .params
+                        .iter()
+                        .position(|parameter| parameter.name == capability.array)
+                        .unwrap();
+                    let array_name = arguments[parameter_index]
+                        .var
+                        .as_ref()
+                        .unwrap()
+                        .name
+                        .clone();
+                    if seen_arrays.insert(array_name.clone()) {
+                        read_write_order
+                            .entry(array_name)
+                            .or_default()
+                            .push(node.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
         nodes.push(node);
     }
     Dag {
         nodes,
+        read_write_order,
     }
 }
-fn is_conflicting(idx1: &Int, idx2: &Int, solver: &Solver) -> bool {
-    solver.check_assumptions(&[idx1.eq(idx2)]) != z3::SatResult::Unsat
+fn is_conflicting(uniq_caps1: Bool, uniq_caps2: Bool, shrd_caps1: Bool, shrd_caps2: Bool, solver: &Solver) -> bool {
+    let a = [
+        Bool::or(&[&uniq_caps1, &shrd_caps1]),
+        uniq_caps2.clone()
+    ];
+    if solver.check_assumptions(&a) != SatResult::Unsat{
+        return true;
+    }
+    let b = [
+        Bool::or(&[uniq_caps2, shrd_caps2]),
+        uniq_caps1
+    ];
+    if solver.check_assumptions(&b) != SatResult::Unsat{
+        return true;
+    }
+    false
 }
 
 enum FenceOrNode{
     Fence,
     Node(Rc<Node>)
 }
-fn order_dag(dag: Dag, assumptions: &Bool) -> Vec<FenceOrNode> {
+fn order_dag(dag: Dag, assumptions: &Bool, functions: &HashMap<String, FnDef<TypedVar>>) -> Vec<FenceOrNode> {
     let Dag {
         nodes,
+        read_write_order,
     } = dag;
 
     let solver = Solver::new();
     solver.assert(assumptions);
     let code_as_z3: Vec<Bool> = nodes.iter().map(|f| f.to_z3()).filter_map(|f| f).collect();
     solver.assert(Bool::and(&code_as_z3));
-    for access_order in read_write_order.values() {
-        for i in 0..access_order.len() {
-            for j in i + 1..access_order.len() {
-                let (idx1, access1) = &access_order[i];
-                let (idx2, access2) = &access_order[j];
-                if matches!(&access1.op, NodeOp::Read { .. })
-                    && matches!(&access2.op, NodeOp::Read { .. })
-                {
+    for (array_name, access_order) in read_write_order.iter(){
+        for i in 0..access_order.len(){
+            for j in i+1..access_order.len(){
+                let variable = Int::fresh_const("cool");
+                let uniq_caps1 = access_order[i].z3_capabilities(Uniq, array_name, &variable, functions);
+                let uniq_caps2 =access_order[j].z3_capabilities(Uniq, array_name, &variable, functions);
+                if uniq_caps1.is_none() && uniq_caps2.is_none(){
                     continue;
                 }
-                let idx1_z3 = idx1.to_z3_int().unwrap();
-                let idx2_z3 = idx2.to_z3_int().unwrap();
+                let shrd_caps1 = access_order[i].z3_capabilities(Shrd, array_name, &variable, functions);
+                let shrd_caps2 = access_order[j].z3_capabilities(Shrd, array_name, &variable, functions);
+                let uniq_caps1 = uniq_caps1.unwrap_or(Bool::from_bool(false));
+                let uniq_caps2 = uniq_caps2.unwrap_or(Bool::from_bool(false));
+                
+                let shrd_caps1 = shrd_caps1.unwrap_or(Bool::from_bool(false));
+                let shrd_caps2 = shrd_caps2.unwrap_or(Bool::from_bool(false));
 
-                if is_conflicting(&idx1_z3, &idx2_z3, &solver) {
-                    println!("conflict found between {} and {}", idx1_z3, idx2_z3);
-                    access1
-                        .fence_parents
-                        .borrow_mut()
-                        .push(Rc::downgrade(access2));
-                }else{
-                    println!("conflict not found between {} and {}", idx1_z3, idx2_z3);
-                }
             }
         }
     }
+    // for access_order in read_write_order.values() {
+    //     for i in 0..access_order.len() {
+    //         for j in i + 1..access_order.len() {
+    //             let (idx1, access1) = &access_order[i];
+    //             let (idx2, access2) = &access_order[j];
+    //             if matches!(&access1.op, NodeOp::Read { .. })
+    //                 && matches!(&access2.op, NodeOp::Read { .. })
+    //             {
+    //                 continue;
+    //             }
+    //             let idx1_z3 = idx1.to_z3_int().unwrap();
+    //             let idx2_z3 = idx2.to_z3_int().unwrap();
+
+    //             if is_conflicting(&idx1_z3, &idx2_z3, &solver) {
+    //                 println!("conflict found between {} and {}", idx1_z3, idx2_z3);
+    //                 access1
+    //                     .fence_parents
+    //                     .borrow_mut()
+    //                     .push(Rc::downgrade(access2));
+    //             }else{
+    //                 println!("conflict not found between {} and {}", idx1_z3, idx2_z3);
+    //             }
+    //         }
+    //     }
+    // }
 
     let mut dependency_counts: HashMap<*const Node, usize> = nodes
         .iter()
@@ -485,21 +609,28 @@ fn order_to_stmts(order: Vec<FenceOrNode>) -> Vec<Stmt<TypedVar>>{
     }
     stmts
 }
-fn place_fences_expr(expr: &mut Expr<TypedVar>, assumptions: &Bool){
-    let dag = stmts_to_dag(&expr.stmts);
+fn place_fences_expr(
+    expr: &mut Expr<TypedVar>,
+    assumptions: &Bool,
+    functions: &HashMap<String, FnDef<TypedVar>>,
+){
+    let dag = stmts_to_dag(&expr.stmts, functions);
     let order = order_dag(dag, assumptions);
     expr.stmts = order_to_stmts(order);
     match &mut expr.tail{
         wavelet_elab::Tail::IfElse { cond, then_e, else_e } => {
             let true_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone())]);
-            place_fences_expr(then_e, &true_assumptions);
+            place_fences_expr(then_e, &true_assumptions, functions);
             let false_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone()).not()]);
-            place_fences_expr(else_e, &false_assumptions);
+            place_fences_expr(else_e, &false_assumptions, functions);
         },
         _ => {}
     }
 }
-fn place_fences_fn(func: &mut FnDef<TypedVar>){
+fn place_fences_fn(
+    func: &mut FnDef<TypedVar>,
+    functions: &HashMap<String, FnDef<TypedVar>>,
+){
     let mut assumptions = Vec::new();
     for x in &func.params{
         if let Ty::Int(Signedness::Unsigned) = &x.ty{
@@ -507,10 +638,15 @@ fn place_fences_fn(func: &mut FnDef<TypedVar>){
         }
     }
     let assumptions = Bool::and(&assumptions);
-    place_fences_expr(&mut func.body, &assumptions);
+    place_fences_expr(&mut func.body, &assumptions, functions);
 }
 pub fn place_fences(program: &mut Program<TypedVar>){
+    let functions = program
+        .defs
+        .iter()
+        .map(|function| (function.name.0.clone(), function.clone()))
+        .collect();
     for func in &mut program.defs{
-        place_fences_fn(func);
+        place_fences_fn(func, &functions);
     }
 }
