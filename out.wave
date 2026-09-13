@@ -1,5 +1,5 @@
 #[cap(arg2: uniq @ arg0 * 4 + 4 + arg1..arg0 * 4 + 8, arg2: shrd @ arg0 * 4 + arg1..arg0 * 4 + 4 + arg1 - 1 + 1)]
-fn f0x61652d630ba0(arg0: i32, arg1: i32, arg2: &mut [i32; 16]) {
+fn f0x64a9047db490(arg0: i32, arg1: i32, arg2: &mut [i32; 16]) {
     let v0 = 4;
     let v1 = 4;
     let v2 = 1;
@@ -13,7 +13,8 @@ fn f0x61652d630ba0(arg0: i32, arg1: i32, arg2: &mut [i32; 16]) {
         let v9 = arg2[v7];
         fence!();
         arg2[v8] = v9;
-        f0x61652d630ba0(arg0, v4, arg2)
+        fence!();
+        f0x64a9047db490(arg0, v4, arg2)
     } else {
         let v10 = ();
         v10
@@ -21,7 +22,7 @@ fn f0x61652d630ba0(arg0: i32, arg1: i32, arg2: &mut [i32; 16]) {
 }
 
 #[cap(arg1: uniq @ arg0 * 4 + 4..16, arg1: shrd @ arg0 * 4..arg0 * 4 + 4 - 1 + 1)]
-fn f0x61652d630950(arg0: i32, arg1: &mut [i32; 16]) {
+fn f0x64a9047db240(arg0: i32, arg1: &mut [i32; 16]) {
     let v0 = 0;
     let v1 = 4;
     let v2 = 1;
@@ -30,8 +31,9 @@ fn f0x61652d630950(arg0: i32, arg1: &mut [i32; 16]) {
     let v5 = arg0 < v3;
     if v5 {
         let v6 = arg0 + v4;
-        let v7 = f0x61652d630ba0(arg0, v0, arg1);
-        f0x61652d630950(v6, arg1)
+        let v7 = f0x64a9047db490(arg0, v0, arg1);
+        fence!();
+        f0x64a9047db240(v6, arg1)
     } else {
         let v8 = ();
         v8
@@ -45,6 +47,6 @@ fn pivot(arg0: &mut [i32; 16]) {
     let v2 = 3;
     let v3 = 4;
     let v5 = ();
-    let v4 = f0x61652d630950(v0, arg0);
+    let v4 = f0x64a9047db240(v0, arg0);
     v5
 }

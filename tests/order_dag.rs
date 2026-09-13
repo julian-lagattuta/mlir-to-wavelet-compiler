@@ -1,10 +1,22 @@
+mod capabilities {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CapabilityType {
+        Shrd,
+        Uniq,
+    }
+}
+
 mod implementation {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/fence_placement.rs"
     ));
 
-    use wavelet_elab::ir::{ArrayLen, Signedness};
+    use wavelet_elab::{
+        Tail,
+        ir::ArrayLen,
+        logic::{cap::CapPattern, region::Region},
+    };
 
     fn int(name: &str) -> TypedVar {
         TypedVar::new(name, Ty::Int(Signedness::Signed))
@@ -53,6 +65,33 @@ mod implementation {
         }
     }
 
+    fn unique_callee(name: &str) -> FnDef<TypedVar> {
+        let index = int("formal_index");
+        let destination = array("formal_array");
+        FnDef {
+            name: FnName(name.to_owned()),
+            params: vec![index.clone(), destination.clone()],
+            alloc_arrays: Vec::new(),
+            caps: vec![CapPattern {
+                array: destination.name,
+                len: ArrayLen::Const(16),
+                uniq: Some(Region::from_bounded(
+                    Idx::Var(index.name.clone()),
+                    Idx::Add(
+                        Box::new(Idx::Var(index.name)),
+                        Box::new(Idx::Const(1)),
+                    ),
+                )),
+                shrd: None,
+            }],
+            returns: Ty::Unit,
+            body: Expr {
+                stmts: Vec::new(),
+                tail: Tail::RetVar(TypedVar::new("unused", Ty::Unit)),
+            },
+        }
+    }
+
     fn name(node: &Rc<Node>) -> &str {
         &node.var.as_ref().expect("named test node").name
     }
@@ -65,14 +104,17 @@ mod implementation {
             NodeOp::Read { array, idx } => {
                 format!("read:{}={}[{}]", name(node), name(array), name(idx))
             }
+            NodeOp::Initial(_) => "initial".to_owned(),
+            NodeOp::TailCall(function, _) => format!("tail:{}", function.0),
             _ => name(node).to_owned(),
         }
     }
 
     fn ordered_labels(stmts: &[Stmt<TypedVar>]) -> Vec<String> {
         order_dag(
-            stmts_to_dag(stmts, &HashMap::new()),
-            Bool::from_bool(true),
+            stmts_to_dag(stmts, &HashMap::new(), HashMap::new(), None),
+            &Bool::from_bool(true),
+            &HashMap::new(),
         )
             .into_iter()
             .map(|item| match item {
@@ -80,6 +122,30 @@ mod implementation {
                 FenceOrNode::Node(node) => label(&node),
             })
             .collect()
+    }
+
+    fn ordered_labels_with_tail(
+        stmts: &[Stmt<TypedVar>],
+        tail_function: &FnName,
+        tail_args: &[TypedVar],
+        functions: &HashMap<String, FnDef<TypedVar>>,
+    ) -> Vec<String> {
+        order_dag(
+            stmts_to_dag(
+                stmts,
+                functions,
+                HashMap::new(),
+                Some((tail_function, tail_args)),
+            ),
+            &Bool::from_bool(true),
+            functions,
+        )
+        .into_iter()
+        .map(|item| match item {
+            FenceOrNode::Fence => "fence".to_owned(),
+            FenceOrNode::Node(node) => label(&node),
+        })
+        .collect()
     }
 
     fn position(order: &[String], label: &str) -> usize {
@@ -280,6 +346,182 @@ mod implementation {
         assert_before(&order, "one", "sum");
     }
 
+    fn conflicting_tail_call_is_terminal_and_fenced() {
+        let output = array("output");
+        let store_index = int("store_index");
+        let call_index = int("call_index");
+        let value = int("value");
+        let function = unique_callee("fill");
+        let function_name = function.name.clone();
+        let functions = HashMap::from([(function_name.0.clone(), function)]);
+        let stmts = vec![
+            let_int(&store_index, 0),
+            let_int(&call_index, 0),
+            let_int(&value, 7),
+            store(&output, &store_index, &value),
+        ];
+        let tail_args = vec![call_index, output];
+
+        let order = ordered_labels_with_tail(
+            &stmts,
+            &function_name,
+            &tail_args,
+            &functions,
+        );
+        let store = position(&order, "write:output[store_index]");
+        let tail = position(&order, "tail:fill");
+
+        assert_eq!(tail, order.len() - 1, "tail call was not terminal: {order:?}");
+        assert!(
+            order[store + 1..tail].iter().any(|item| item == "fence"),
+            "conflicting tail call was not fenced: {order:?}"
+        );
+
+        let mut expr = Expr {
+            stmts,
+            tail: Tail::TailCall {
+                func: function_name,
+                args: tail_args,
+            },
+        };
+        place_fences_expr(
+            &mut expr,
+            &Bool::from_bool(true),
+            HashMap::new(),
+            &functions,
+        );
+
+        assert!(matches!(expr.tail, Tail::TailCall { .. }));
+        assert!(matches!(
+            expr.stmts.last(),
+            Some(Stmt::LetOp { fence: true, .. })
+        ));
+    }
+
+    fn scalar_call_arguments_are_substituted_in_capabilities() {
+        let output = array("output");
+        let store_index = int("store_index");
+        let call_index = int("call_index");
+        let value = int("value");
+        let function = unique_callee("fill");
+        let function_name = function.name.clone();
+        let functions = HashMap::from([(function_name.0.clone(), function)]);
+        let stmts = vec![
+            let_int(&store_index, 0),
+            let_int(&call_index, 1),
+            let_int(&value, 7),
+            store(&output, &store_index, &value),
+        ];
+        let tail_args = vec![call_index, output];
+
+        let order = ordered_labels_with_tail(
+            &stmts,
+            &function_name,
+            &tail_args,
+            &functions,
+        );
+        let store = position(&order, "write:output[store_index]");
+        let tail = position(&order, "tail:fill");
+
+        assert_eq!(tail, order.len() - 1, "tail call was not terminal: {order:?}");
+        assert!(
+            order[store + 1..tail].iter().all(|item| item != "fence"),
+            "disjoint substituted tail-call capability was fenced: {order:?}"
+        );
+    }
+
+    fn unfenced_parent_accesses_are_propagated_into_branches() {
+        let output = array("output");
+        let index = int("index");
+        let value = int("value");
+        let condition = TypedVar::new("condition", Ty::Bool);
+        let loaded = int("loaded");
+        let mut expr = Expr {
+            stmts: vec![
+                let_int(&index, 0),
+                let_int(&value, 7),
+                Stmt::LetVal {
+                    var: condition.clone(),
+                    val: Val::Bool(true),
+                    fence: false,
+                },
+                store(&output, &index, &value),
+            ],
+            tail: Tail::IfElse {
+                cond: condition,
+                then_e: Box::new(Expr {
+                    stmts: vec![load(&loaded, &output, &index)],
+                    tail: Tail::RetVar(loaded),
+                }),
+                else_e: Box::new(Expr {
+                    stmts: Vec::new(),
+                    tail: Tail::RetVar(value),
+                }),
+            },
+        };
+
+        place_fences_expr(
+            &mut expr,
+            &Bool::from_bool(true),
+            HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let Tail::IfElse { then_e, .. } = expr.tail else {
+            panic!("expected if tail")
+        };
+        assert!(matches!(
+            then_e.stmts.first(),
+            Some(Stmt::LetVal {
+                val: Val::Unit,
+                fence: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            then_e.stmts.get(1),
+            Some(Stmt::LetOp { op: Op::Load { .. }, .. })
+        ));
+    }
+
+    fn empty_body_can_emit_a_fence_before_its_tail_call() {
+        let output = array("output");
+        let index = int("index");
+        let function = unique_callee("fill");
+        let function_name = function.name.clone();
+        let functions = HashMap::from([(function_name.0.clone(), function)]);
+        let point = Int::new_const("cool").eq(Int::new_const(index.name.clone()));
+        let initial_capabilities = HashMap::from([(
+            output.name.clone(),
+            (Bool::from_bool(false), point),
+        )]);
+        let mut expr = Expr {
+            stmts: Vec::new(),
+            tail: Tail::TailCall {
+                func: function_name,
+                args: vec![index, output],
+            },
+        };
+
+        place_fences_expr(
+            &mut expr,
+            &Bool::from_bool(true),
+            initial_capabilities,
+            &functions,
+        );
+
+        assert!(matches!(expr.tail, Tail::TailCall { .. }));
+        assert_eq!(expr.stmts.len(), 1);
+        assert!(matches!(
+            &expr.stmts[0],
+            Stmt::LetVal {
+                val: Val::Unit,
+                fence: true,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn child_order_dag_case() {
         let Ok(case) = std::env::var("ORDER_DAG_TEST_CASE") else {
@@ -294,6 +536,10 @@ mod implementation {
             "disjoint" => provably_disjoint_accesses_stay_in_the_same_fence_group(),
             "different_arrays" => accesses_to_different_arrays_stay_in_the_same_fence_group(),
             "topological" => operation_results_follow_their_dependencies(),
+            "tail_conflict" => conflicting_tail_call_is_terminal_and_fenced(),
+            "tail_substitution" => scalar_call_arguments_are_substituted_in_capabilities(),
+            "branch_initial" => unfenced_parent_accesses_are_propagated_into_branches(),
+            "empty_tail_fence" => empty_body_can_emit_a_fence_before_its_tail_call(),
             _ => panic!("unknown order_dag test case {case:?}"),
         }
     }
@@ -307,7 +553,8 @@ mod implementation {
             fence_parents: Default::default(),
         });
 
-        let stmts = order_to_stmts(vec![FenceOrNode::Node(variable), FenceOrNode::Fence]);
+        let order = vec![FenceOrNode::Node(variable), FenceOrNode::Fence];
+        let stmts = order_to_stmts(&order);
 
         assert_eq!(stmts.len(), 1);
         let Stmt::LetVal {
@@ -320,6 +567,53 @@ mod implementation {
         };
         assert_eq!(var.ty, Ty::Unit);
         assert!(var.name.starts_with("_fence_dummy_"));
+    }
+
+    #[test]
+    fn initial_at_a_fence_boundary_emits_a_fenced_unit_binding() {
+        let initial = Rc::new(Node {
+            op: NodeOp::Initial(HashMap::new()),
+            var: None,
+            parents: Default::default(),
+            fence_parents: Default::default(),
+        });
+        let order = vec![FenceOrNode::Node(initial), FenceOrNode::Fence];
+
+        let stmts = order_to_stmts(&order);
+
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(
+            &stmts[0],
+            Stmt::LetVal {
+                val: Val::Unit,
+                fence: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unfenced_initial_capabilities_are_propagated() {
+        let index = Int::new_const("cool");
+        let initial_uniq = index.eq(Int::from_i64(3));
+        let initial = Rc::new(Node {
+            op: NodeOp::Initial(HashMap::from([(
+                "output".to_owned(),
+                (Bool::from_bool(false), initial_uniq.clone()),
+            )])),
+            var: None,
+            parents: Default::default(),
+            fence_parents: Default::default(),
+        });
+        let order = vec![FenceOrNode::Node(initial)];
+
+        let propagated = calculate_initial_capabilities(&order, &HashMap::new());
+
+        let solver = Solver::new();
+        assert_eq!(
+            solver.check_assumptions(&[propagated["output"].1.eq(initial_uniq).not()]),
+            SatResult::Unsat,
+        );
     }
 }
 
@@ -402,4 +696,24 @@ fn does_not_add_a_dependency_between_different_arrays() {
 #[test]
 fn emits_operations_in_topological_order() {
     run_case("topological");
+}
+
+#[test]
+fn places_a_conflicting_tail_call_after_a_fence() {
+    run_case("tail_conflict");
+}
+
+#[test]
+fn substitutes_scalar_arguments_in_tail_call_capabilities() {
+    run_case("tail_substitution");
+}
+
+#[test]
+fn propagates_unfenced_accesses_into_branches() {
+    run_case("branch_initial");
+}
+
+#[test]
+fn emits_a_dummy_fence_before_an_empty_body_tail_call() {
+    run_case("empty_tail_fence");
 }
