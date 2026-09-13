@@ -1,52 +1,50 @@
-#[cap(a: uniq @ k * 4 + 4 + j..k * 4 + 8, a: shrd @ k * 4 + j..k * 4 + 4)]
-fn inner_j(k: i32, j: u32, a: &mut [i32; 16]) {
-    let row_len = 4;
-    let step = 1;
-    let more = j < row_len;
-    if more {
-        let j_next = j + step;
-        let krow = k * row_len;
-        let dstrow = krow + row_len;
-        let src_k = krow + j;
-        let dst = dstrow + j;
-        let vk = a[src_k];
-        a[dst] = vk;
-        inner_j(k, j_next, a)
-    } else {
-        let unit = ();
-        unit
-    }
-}
-
-#[cap(a: uniq @ 4..16, a: shrd@ 0..4)]
-fn outer_k(k: u32, a: &mut [i32; 16]) {
-
-    // uniq @ k * 4 + 4 + j..k * 4 + 8
-    // shrd @  k * 4 + j..k * 4 + 4
-    let row_len = 4;
-    let zero = 0;
-    let one = 1;
-    let k_end = 3;
-    let step = 1;
-    let more = k < k_end;
-    if more {
-        let k_next = k + step;
-        let inner_call = inner_j(k, zero, a);
+#[cap(arg2: uniq @ arg0 * 4 + 4 + arg1..arg0 * 4 + 8, arg2: shrd @ arg0 * 4 + arg1..arg0 * 4 + 4 + arg1 - 1 + 1)]
+fn f0x61652d630ba0(arg0: i32, arg1: i32, arg2: &mut [i32; 16]) {
+    let v0 = 4;
+    let v1 = 4;
+    let v2 = 1;
+    let v3 = arg1 < v1;
+    if v3 {
+        let v4 = arg1 + v2;
+        let v5 = arg0 * v0;
+        let v6 = v5 + v0;
+        let v7 = v5 + arg1;
+        let v8 = v6 + arg1;
+        let v9 = arg2[v7];
         fence!();
-        outer_k(k_next, a)
+        arg2[v8] = v9;
+        f0x61652d630ba0(arg0, v4, arg2)
     } else {
-        let unit = ();
-        unit
+        let v10 = ();
+        v10
     }
 }
 
-#[cap(a: uniq @ 0..16)]
-fn pivot(a: &mut [i32; 16]) {
-    let k0 = 0;
-    let one = 1;
-    let three = 3;
-    let four = 4;
-    let outer_call = outer_k(k0, a);
-    let unit = ();
-    unit
+#[cap(arg1: uniq @ arg0 * 4 + 4..16, arg1: shrd @ arg0 * 4..arg0 * 4 + 4 - 1 + 1)]
+fn f0x61652d630950(arg0: i32, arg1: &mut [i32; 16]) {
+    let v0 = 0;
+    let v1 = 4;
+    let v2 = 1;
+    let v3 = 3;
+    let v4 = 1;
+    let v5 = arg0 < v3;
+    if v5 {
+        let v6 = arg0 + v4;
+        let v7 = f0x61652d630ba0(arg0, v0, arg1);
+        f0x61652d630950(v6, arg1)
+    } else {
+        let v8 = ();
+        v8
+    }
+}
+
+#[cap(arg0: uniq @ 4..16, arg0: shrd @ 0..4)]
+fn pivot(arg0: &mut [i32; 16]) {
+    let v0 = 0;
+    let v1 = 1;
+    let v2 = 3;
+    let v3 = 4;
+    let v5 = ();
+    let v4 = f0x61652d630950(v0, arg0);
+    v5
 }

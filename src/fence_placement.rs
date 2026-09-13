@@ -8,7 +8,7 @@ use wavelet_elab::{
 use z3::{SatResult, ast::{Bool, Int}};
 use z3::Solver;
 
-use crate::capabilities::CapabilityType::{self, Shrd, Uniq};
+use crate::{capabilities::CapabilityType::{self, Shrd, Uniq}, fence_placement::NodeOp::Initial};
 
 fn idx_to_z3(idx: &Idx) -> Int {
     match idx {
@@ -19,7 +19,19 @@ fn idx_to_z3(idx: &Idx) -> Int {
         Idx::Mul(lhs, rhs) => Int::mul(&[&idx_to_z3(lhs), &idx_to_z3(rhs)]),
     }
 }
-
+fn inner_to_outer_array_map<'a,T>(func: &'a FnDef<T>, args: &Vec<Rc<Node>>) -> HashMap<String, String>{
+    let mut map = HashMap::new();
+    for (arg, param) in args.iter().zip(func.params.iter()){
+        let inner_name = match &param.ty{
+            Ty::RefShrd { elem, len } => &param.name,
+            Ty::RefUniq { elem, len } => &param.name,
+            _ => continue
+        };
+        let outer_name: String = arg.var.as_ref().unwrap().name.clone();
+        map.insert(inner_name.clone(), outer_name);
+    }
+    map
+}
 struct Node {
     op: NodeOp,
     var: Option<TypedVar>,
@@ -40,15 +52,42 @@ enum NodeOp {
         idx: Rc<Node>,
     },
     Variable,
+    Initial(HashMap<String, (Bool, Bool)>)
 }
 impl Node {
-    fn z3_capabilities(&self, cap_type: CapabilityType,array_name: &String,variable: &Int, functions: &HashMap<String, FnDef<TypedVar>>)->Option<Bool>{
+    fn arrays_accessed(&self) -> Vec<String>{
+        match &self.op{
+            NodeOp::Constant(val) => Vec::new(),
+            NodeOp::Call(fn_name, nodes) => {
+                let mut vars: Vec<String> = Vec::new();
+                for node in nodes{
+                    let var = node.var.as_ref().unwrap();
+                    let name = match &var.ty{
+                        Ty::RefShrd { elem, len } => &var.name,
+                        Ty::RefUniq { elem, len } => &var.name,
+                        _=> continue
+                    };
+                    vars.push(name.clone());
+                }
+                vars
+            },
+            NodeOp::Write { array, idx, value } =>{
+                vec![array.var.as_ref().unwrap().name.clone()]
+            },
+            NodeOp::Read { array, idx } => {
+                vec![array.var.as_ref().unwrap().name.clone()]
+            },
+            _ => Vec::new()
+        }
+    }
+    fn z3_capabilities_for_array(&self, cap_type: CapabilityType,array_name: &String,variable: &Int, functions: &HashMap<String, FnDef<TypedVar>>)->Option<Bool>{
         match &self.op{
             NodeOp::Call(fn_name, nodes) => {
                 let fndef =functions.get(&fn_name.0).unwrap();
                 let mut props = Vec::new();
+                let array_map = inner_to_outer_array_map(fndef, nodes);
                 for cap in fndef.caps.iter(){
-                    if &cap.array != array_name{
+                    if array_map.get(&cap.array).unwrap() != array_name{
                         continue;
                     }
                     
@@ -83,6 +122,12 @@ impl Node {
                 }
                 Some(variable.eq(idx.to_z3_int().unwrap()))
             },
+            NodeOp::Initial (map)=>{
+                match cap_type{
+                    Shrd => Some(map.get(array_name)?.0.clone()),
+                    Uniq => Some(map.get(array_name)?.1.clone()),
+                }
+            }
             _ => None
         }
     }
@@ -157,6 +202,7 @@ impl Node {
                 fence: true,
             }),
             NodeOp::Variable => None,
+            NodeOp::Initial  (_) => None,
         }
     }
     fn to_z3_bool(&self) -> Option<Bool> {
@@ -198,8 +244,9 @@ impl Node {
                     _ => None,
                 }?;
                 Some(result.eq(value))
-            }
+            },
             NodeOp::Constant(_)
+            | NodeOp::Initial(_)
             | NodeOp::Call(..)
             | NodeOp::Write { .. }
             | NodeOp::Read { .. }
@@ -224,6 +271,7 @@ impl Node {
                 Some(result.eq(value))
             }
             NodeOp::Constant(_)
+            | NodeOp::Initial (_)
             | NodeOp::Call(..)
             | NodeOp::Write { .. }
             | NodeOp::Read { .. }
@@ -300,6 +348,7 @@ struct Dag {
 fn stmts_to_dag(
     stmts: &[Stmt<TypedVar>],
     functions: &HashMap<String, FnDef<TypedVar>>,
+    initial_capabilities: HashMap<String,(Bool, Bool)>
 ) -> Dag {
     let base_nodes = collect_free_variables(stmts);
     let mut variable_map: HashMap<String, Rc<Node>> = base_nodes
@@ -310,8 +359,19 @@ fn stmts_to_dag(
                 .map(|var| (var.name.clone(), node.clone()))
         })
         .collect();
-    let mut nodes = base_nodes.clone();
+    let mut nodes = Vec::new();
+    nodes.push(Rc::new(Node{
+        op: Initial(initial_capabilities),
+        var: None,
+        parents: Default::default(),
+        fence_parents: Default::default(),
+    }));
+    nodes.extend(base_nodes);
     let mut read_write_order: HashMap<String, Vec<Rc<Node>>> = HashMap::new();
+    let Initial(initial_capabilities) = &nodes[0].op else {panic!("impossible")};
+    for array in initial_capabilities.keys(){
+        read_write_order.insert(array.clone(), vec![nodes[0].clone()]);
+    }
     for stmt in stmts {
         let node = match stmt {
             Stmt::LetVal {
@@ -393,13 +453,14 @@ fn stmts_to_dag(
             }
         };
         let used_nodes = match &node.op {
-            NodeOp::Constant(_) | NodeOp::Variable => Vec::new(),
+            NodeOp::Constant(_)| NodeOp::Initial {..} | NodeOp::Variable => Vec::new(),
             NodeOp::Call(_, args) => args.clone(),
             NodeOp::BinOp(_, a, b) => vec![a.clone(), b.clone()],
             NodeOp::Write { array, idx, value } => {
                 vec![array.clone(), idx.clone(), value.clone()]
             }
             NodeOp::Read { array, idx } => vec![array.clone(), idx.clone()],
+
         };
         for used_node in used_nodes {
             used_node.parents.borrow_mut().push(Rc::downgrade(&node));
@@ -417,6 +478,7 @@ fn stmts_to_dag(
             }
             NodeOp::Call(function_name, arguments) => {
                 let function = functions.get(&function_name.0).unwrap();
+                let array_map = inner_to_outer_array_map(function, arguments);
                 let mut seen_arrays = HashSet::new();
                 for capability in &function.caps {
                     let parameter_index = function
@@ -424,15 +486,16 @@ fn stmts_to_dag(
                         .iter()
                         .position(|parameter| parameter.name == capability.array)
                         .unwrap();
-                    let array_name = arguments[parameter_index]
+                    let inner_array_name = arguments[parameter_index]
                         .var
                         .as_ref()
                         .unwrap()
                         .name
                         .clone();
+                    let array_name = array_map.get(&inner_array_name).unwrap();
                     if seen_arrays.insert(array_name.clone()) {
                         read_write_order
-                            .entry(array_name)
+                            .entry(array_name.clone())
                             .or_default()
                             .push(node.clone());
                     }
@@ -469,12 +532,12 @@ enum FenceOrNode{
     Fence,
     Node(Rc<Node>)
 }
-fn order_dag(dag: Dag, assumptions: &Bool, functions: &HashMap<String, FnDef<TypedVar>>) -> Vec<FenceOrNode> {
-    let Dag {
-        nodes,
-        read_write_order,
-    } = dag;
-
+fn place_dependencies(
+    nodes: &[Rc<Node>],
+    read_write_order: &HashMap<String, Vec<Rc<Node>>>,
+    assumptions: &Bool,
+    functions: &HashMap<String, FnDef<TypedVar>>,
+) {
     let solver = Solver::new();
     solver.assert(assumptions);
     let code_as_z3: Vec<Bool> = nodes.iter().map(|f| f.to_z3()).filter_map(|f| f).collect();
@@ -483,47 +546,37 @@ fn order_dag(dag: Dag, assumptions: &Bool, functions: &HashMap<String, FnDef<Typ
         for i in 0..access_order.len(){
             for j in i+1..access_order.len(){
                 let variable = Int::fresh_const("cool");
-                let uniq_caps1 = access_order[i].z3_capabilities(Uniq, array_name, &variable, functions);
-                let uniq_caps2 =access_order[j].z3_capabilities(Uniq, array_name, &variable, functions);
+                let uniq_caps1 = access_order[i].z3_capabilities_for_array(Uniq, array_name, &variable, functions);
+                let uniq_caps2 =access_order[j].z3_capabilities_for_array(Uniq, array_name, &variable, functions);
                 if uniq_caps1.is_none() && uniq_caps2.is_none(){
                     continue;
                 }
-                let shrd_caps1 = access_order[i].z3_capabilities(Shrd, array_name, &variable, functions);
-                let shrd_caps2 = access_order[j].z3_capabilities(Shrd, array_name, &variable, functions);
+                let shrd_caps1 = access_order[i].z3_capabilities_for_array(Shrd, array_name, &variable, functions);
+                let shrd_caps2 = access_order[j].z3_capabilities_for_array(Shrd, array_name, &variable, functions);
                 let uniq_caps1 = uniq_caps1.unwrap_or(Bool::from_bool(false));
                 let uniq_caps2 = uniq_caps2.unwrap_or(Bool::from_bool(false));
                 
                 let shrd_caps1 = shrd_caps1.unwrap_or(Bool::from_bool(false));
                 let shrd_caps2 = shrd_caps2.unwrap_or(Bool::from_bool(false));
 
+                if is_conflicting(uniq_caps1, uniq_caps2, shrd_caps1, shrd_caps2, &solver){
+                    access_order[i]
+                        .fence_parents
+                        .borrow_mut()
+                        .push(Rc::downgrade(&access_order[j]));
+                }
             }
         }
     }
-    // for access_order in read_write_order.values() {
-    //     for i in 0..access_order.len() {
-    //         for j in i + 1..access_order.len() {
-    //             let (idx1, access1) = &access_order[i];
-    //             let (idx2, access2) = &access_order[j];
-    //             if matches!(&access1.op, NodeOp::Read { .. })
-    //                 && matches!(&access2.op, NodeOp::Read { .. })
-    //             {
-    //                 continue;
-    //             }
-    //             let idx1_z3 = idx1.to_z3_int().unwrap();
-    //             let idx2_z3 = idx2.to_z3_int().unwrap();
+}
 
-    //             if is_conflicting(&idx1_z3, &idx2_z3, &solver) {
-    //                 println!("conflict found between {} and {}", idx1_z3, idx2_z3);
-    //                 access1
-    //                     .fence_parents
-    //                     .borrow_mut()
-    //                     .push(Rc::downgrade(access2));
-    //             }else{
-    //                 println!("conflict not found between {} and {}", idx1_z3, idx2_z3);
-    //             }
-    //         }
-    //     }
-    // }
+fn order_dag(dag: Dag, assumptions: &Bool, functions: &HashMap<String, FnDef<TypedVar>>) -> Vec<FenceOrNode> {
+    let Dag {
+        nodes,
+        read_write_order,
+    } = dag;
+
+    place_dependencies(&nodes, &read_write_order, assumptions, functions);
 
     let mut dependency_counts: HashMap<*const Node, usize> = nodes
         .iter()
@@ -597,7 +650,7 @@ fn order_dag(dag: Dag, assumptions: &Bool, functions: &HashMap<String, FnDef<Typ
     });
     order
 }
-fn order_to_stmts(order: Vec<FenceOrNode>) -> Vec<Stmt<TypedVar>>{
+fn order_to_stmts(order: &Vec<FenceOrNode>) -> Vec<Stmt<TypedVar>>{
     let mut stmts = Vec::new();
     for i in 0..order.len(){
         if let FenceOrNode::Node(node) = &order[i]{
@@ -606,24 +659,63 @@ fn order_to_stmts(order: Vec<FenceOrNode>) -> Vec<Stmt<TypedVar>>{
                 stmts.push(x);
             }
         }
-    }
+    } 
     stmts
+}
+fn calculate_initial_capabilities(order: &Vec<FenceOrNode>, functions: &HashMap<String, FnDef<TypedVar>>) -> HashMap<String,(Bool, Bool)>{
+    let mut uniq_map  = HashMap::new();
+    let mut shrd_map  = HashMap::new();
+    for stmt in order.iter().rev(){
+        let FenceOrNode::Node(stmt) = stmt else {
+            break
+        };
+        let arrays = stmt.arrays_accessed();
+        let variable = Int::new_const("cool");
+
+
+        for array in arrays{
+            let uniq = stmt.z3_capabilities_for_array(Uniq, &array, &variable, functions);
+            let shrd = stmt.z3_capabilities_for_array(Shrd, &array, &variable, functions);
+            if let Some(shrd) = shrd{
+                shrd_map.entry(array.clone()).or_insert_with(| |{ Vec::new()}).push(shrd);
+            }
+            if let Some(uniq) = uniq{
+                uniq_map.entry(array).or_insert_with(| |{ Vec::new()}).push(uniq);
+            }
+        }
+    }
+    let mut combined = HashMap::new();
+    for (k,v) in shrd_map{
+        combined.entry(k).or_insert_with(||{(Vec::new(), Vec::new())}).0.extend(v);
+    }
+    for (k,v) in uniq_map{
+        combined.entry(k).or_insert_with(||{(Vec::new(), Vec::new())}).1.extend(v);
+    }
+    combined
+        .into_iter()
+        .map(|(k, (a, b))| (k, (Bool::or(&a), Bool::or(&b))))
+        .collect()
 }
 fn place_fences_expr(
     expr: &mut Expr<TypedVar>,
     assumptions: &Bool,
+    initial_capabilities: HashMap<String,(Bool, Bool)>, //stores shrd,uniq of everything up to the beginning of the block
     functions: &HashMap<String, FnDef<TypedVar>>,
 ){
-    let dag = stmts_to_dag(&expr.stmts, functions);
-    let order = order_dag(dag, assumptions);
-    expr.stmts = order_to_stmts(order);
+    let dag = stmts_to_dag(&expr.stmts, functions, initial_capabilities);
+    let order = order_dag(dag, assumptions, functions);
+    expr.stmts = order_to_stmts(&order);
+    let initial_capabilities = calculate_initial_capabilities(&order, functions);
     match &mut expr.tail{
         wavelet_elab::Tail::IfElse { cond, then_e, else_e } => {
             let true_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone())]);
-            place_fences_expr(then_e, &true_assumptions, functions);
+            place_fences_expr(then_e, &true_assumptions, initial_capabilities.clone(),functions);
             let false_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone()).not()]);
-            place_fences_expr(else_e, &false_assumptions, functions);
+            place_fences_expr(else_e, &false_assumptions, initial_capabilities, functions);
         },
+        wavelet_elab::Tail::TailCall { func, args } => {
+
+        }
         _ => {}
     }
 }

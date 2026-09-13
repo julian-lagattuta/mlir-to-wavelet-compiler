@@ -476,6 +476,7 @@ fn invalid<T>(op: impl Into<String>) -> Result<T, TypeError> {
     Err(TypeError::InvalidOp { op: op.into() })
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::type_program;
