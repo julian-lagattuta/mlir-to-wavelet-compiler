@@ -3,7 +3,7 @@ use std::{
 };
 
 use melior::ir::{
-    BlockLike, BlockRef, Module, OperationRef, RegionLike, ShapedTypeLike, Value, ValueLike, attribute::IntegerAttribute, block::BlockArgument, operation::{OperationLike, OperationResult, WalkOrder, WalkResult}, r#type::{DimSize, MemRefType},
+    BlockLike, BlockRef, Module, OperationRef, RegionLike, ShapedTypeLike, Value, ValueLike, attribute::{FlatSymbolRefAttribute, IntegerAttribute, StringAttribute}, block::BlockArgument, operation::{OperationLike, OperationResult, WalkOrder, WalkResult}, r#type::{DimSize, MemRefType},
 };
 use wavelet_elab::{
     ir::Signedness,
@@ -13,7 +13,7 @@ use z3::{
     SatResult, Solver, ast::{self, Ast, Bool},
 };
 
-use crate::{util::BlockIter, value_to_name};
+use crate::{functions_in_call_order, value_to_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CapabilityType {
@@ -46,6 +46,31 @@ pub(super) enum CapabilityExpr<'c, 'a> {
 }
 
 impl<'c, 'a> CapabilityExpr<'c, 'a> {
+    /// Replaces parameters positionally; a referenced None poisons this expression.
+    pub(super) fn substitute(
+        &self,
+        parameters: &[Value<'c, 'a>],
+        substitutions: &[Option<CapabilityExpr<'c, 'a>>],
+    ) -> anyhow::Result<Option<Self>> {
+        if parameters.len() != substitutions.len() {
+            return Err(anyhow::anyhow!("parameter and substitution counts must match"));
+        }
+        Ok(match self {
+            Self::Variable { value, .. } | Self::Blackbox { value, .. } => parameters
+                .iter()
+                .position(|parameter| parameter == value)
+                .map_or_else(|| Some(self.clone()), |index| substitutions[index].clone()),
+            Self::BinOp { operation, operands } => operands.0
+                .substitute(parameters, substitutions)?
+                .zip(operands.1.substitute(parameters, substitutions)?)
+                .map(|(lhs, rhs)| Self::BinOp {
+                    operation: *operation,
+                    operands: (Rc::new(lhs), Rc::new(rhs)),
+                }),
+            Self::Constant(_) => Some(self.clone()),
+        })
+    }
+
     pub(super) fn to_wavelet_idx<'d, 'b>(
         &self
     ) -> Idx {
@@ -314,6 +339,36 @@ pub(super) struct Capability<'c, 'a> {
     pub(super) capability_expr: Option<(CapabilityExpr<'c, 'a>, CapabilityExpr<'c, 'a>)>, // None means "poison" which takes the entire bounds of the array
 }
 
+impl<'c, 'a> Capability<'c, 'a> {
+    /// Substitutes the array and both inclusive bounds, preserving poisoned regions.
+    pub(super) fn substitute(
+        &self,
+        parameters: &[Value<'c, 'a>],
+        substitutions: &[Option<CapabilityExpr<'c, 'a>>],
+    ) -> anyhow::Result<Self> {
+        if parameters.len() != substitutions.len() {
+            return Err(anyhow::anyhow!("parameter and substitution counts must match"));
+        }
+        let array = match parameters.iter().position(|parameter| *parameter == self.array) {
+            Some(index) => match &substitutions[index] {
+                Some(CapabilityExpr::Variable { value, .. } | CapabilityExpr::Blackbox { value, .. })
+                    if MemRefType::try_from(value.r#type()).is_ok() => *value,
+                _ => return Err(anyhow::anyhow!("capability array substitution must be a memref value")),
+            },
+            None => self.array,
+        };
+        Ok(Self {
+            array,
+            capability_type: self.capability_type,
+            capability_expr: match &self.capability_expr {
+                Some((start, end)) => start.substitute(parameters, substitutions)?
+                    .zip(end.substitute(parameters, substitutions)?),
+                None => None,
+            },
+        })
+    }
+}
+
 pub(super) fn capability_constants<'c, 'a>(
     capability_map: &mut HashMap<*mut c_void, Vec<Capability<'c, 'a>>>,
 ) {
@@ -503,7 +558,7 @@ pub(super) fn generate_expr<'c, 'a>(
 where
     'c: 'a,
 {
-    generate_expr_helper(value, target_for_loop)
+    generate_expr_helper(value, target_for_loop, false)
 }
 
 pub(super) fn constant_fold_value(value: Value<'_, '_>) -> Option<i64> {
@@ -529,6 +584,7 @@ pub(super) fn constant_fold_value(value: Value<'_, '_>) -> Option<i64> {
 fn generate_expr_helper<'c, 'a>(
     value: Value<'c, 'a>,
     target_for_loop: Option<OperationRef<'c, 'a>>,
+    expand_external_arithmetic: bool,
 ) -> Option<CapabilityExpr<'c, 'a>>
 where
     'c: 'a,
@@ -566,7 +622,13 @@ where
             .is_some_and(|block| block_is_inside_operation(block, for_loop))
     });
 
-    if !is_defined_inside_target {
+    let ident = operation.name();
+    let name = ident.as_string_ref().as_str().unwrap();
+    // Call arguments must express supported arithmetic in terms of the caller's
+    // parameters, even when the defining operation is outside the target loop.
+    let expand_external = expand_external_arithmetic
+        && matches!(name, "arith.addi" | "arith.subi" | "arith.muli");
+    if !is_defined_inside_target && !expand_external {
         return Some(match constant_fold_value(value) {
             Some(value) => CapabilityExpr::Constant(value),
             None => CapabilityExpr::Blackbox {
@@ -576,8 +638,6 @@ where
         });
     }
 
-    let ident = operation.name();
-    let name = ident.as_string_ref().as_str().unwrap();
     let binop = match name {
         "arith.constant" => {
             let attr = operation.attribute("value").ok()?;
@@ -593,10 +653,12 @@ where
         Rc::new(generate_expr_helper(
             operation.operand(0).unwrap(),
             target_for_loop,
+            expand_external_arithmetic,
         )?),
         Rc::new(generate_expr_helper(
             operation.operand(1).unwrap(),
             target_for_loop,
+            expand_external_arithmetic,
         )?),
     );
     Some(CapabilityExpr::BinOp {
@@ -665,32 +727,56 @@ fn push_capability<'c, 'a>(
     capabilities.push(capability);
     true
 }
-pub(super) fn compute_capabilities<'c, 'a>(module: &'c Module<'c>) -> HashMap<* mut c_void, Vec<Capability<'c, 'a>>>
+/// Keeps source parameter order, using distinct_objects results for array parameters.
+pub(super) fn function_parameter_values<'c, 'a>(function: OperationRef<'c, 'a>) -> Vec<Value<'c, 'a>> {
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let mut parameters: Vec<Value<'c, 'a>> = (0..body.argument_count())
+        .map(|index| body.argument(index).unwrap().into())
+        .collect();
+    if let Some(distinct) = body.first_operation().filter(|operation| {
+        operation.name().as_string_ref().as_str().unwrap() == "memref.distinct_objects"
+    }) {
+        for parameter in &mut parameters {
+            if MemRefType::try_from(parameter.r#type()).is_ok() {
+                if let Some(index) = distinct.operands().position(|operand| operand == *parameter) {
+                    *parameter = distinct.result(index).unwrap().into();
+                }
+            }
+        }
+    }
+    parameters
+}
+
+pub(super) fn compute_capabilities<'c, 'a>(module: &'c Module<'c>) -> anyhow::Result<HashMap<* mut c_void, Vec<Capability<'c, 'a>>>>
 where 'c: 'a
 {
     let mut hashmap = HashMap::new();
-    for func in BlockIter::new(module.body()){
-        let ident = func.name();
-        let name = ident.as_string_ref().as_str().unwrap();
-        if name != "func.func" {
-            panic!("expected a function found some other operation")
-        }
-        let mut map  = HashMap::new();
+    let functions = functions_in_call_order(module.body())?;
+    let mut functions_by_name = HashMap::new();
+    for func in &functions {
+        let name = StringAttribute::try_from(func.attribute("sym_name")?)?
+            .value()
+            .to_owned();
+        functions_by_name.insert(name, *func);
+    }
+    for func in functions {
         let mut caps = Vec::new();
+        let parameters = function_parameter_values(func);
         block_capabilities(
             func.region(0).unwrap().first_block().unwrap(), 
-            &mut map, &mut caps
+            &mut hashmap, &mut caps, &functions_by_name, &parameters
         );
-        hashmap.extend(map);
         hashmap.insert(func.to_raw().ptr, coalesce_capabilities(caps));
     }
     capability_constants(&mut hashmap);
-    hashmap
+    Ok(hashmap)
 }
 pub(super) fn block_capabilities<'c, 'a, 'b>(
     block: BlockRef<'c, 'a>,
     capability_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>,
     capabilities: &mut Vec<Capability<'c, 'a>>,
+    functions_by_name: &HashMap<String, OperationRef<'c, 'a>>,
+    parameters: &[Value<'c, 'a>],
 ) where
     'c: 'a,
 {
@@ -703,8 +789,39 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
         let ident = current.name();
         let name = ident.as_string_ref().as_str().unwrap();
         println!("[block_capabilities] visiting {name}");
-        
-        if name == "memref.load" {
+        if name == "func.call"{
+            let callee = FlatSymbolRefAttribute::try_from(current.attribute("callee").unwrap())
+                .unwrap();
+            let func_op = functions_by_name.get(callee.value()).unwrap();
+            let callee_parameters = function_parameter_values(*func_op);
+            let target_for_loop = find_parent_for(current);
+            let substitutions: Vec<_> = current.operands().map(|value| {
+                // Array identity is known even when scalar index expressions are not.
+                if MemRefType::try_from(value.r#type()).is_ok() {
+                    Some(CapabilityExpr::Blackbox { value, signedness: Signedness::Signed })
+                } else {
+                    generate_expr_helper(value, target_for_loop, true)
+                }
+            }).collect();
+            let inner_function_capabilities = capability_map.get(&func_op.to_raw().ptr)
+                .cloned()
+                .unwrap_or_else(|| {
+                    // A self-call has no completed summary yet. Require full-array
+                    // unique capabilities rather than omitting recursive accesses.
+                    callee_parameters.iter().filter_map(|value| {
+                        MemRefType::try_from(value.r#type()).ok().map(|_| Capability {
+                            array: *value,
+                            capability_type: CapabilityType::Uniq,
+                            capability_expr: None,
+                        })
+                    }).collect()
+                });
+            for capability in inner_function_capabilities {
+                let translated = capability.substitute(&callee_parameters, &substitutions)
+                    .expect("call capability substitution failed");
+                push_capability(capabilities, translated);
+            }
+        }else if name == "memref.load" {
             let array = current.operand(0).unwrap();
             let idx = current.operand(1).unwrap();
             let capability_expr = generate_expr(idx, find_parent_for(current));
@@ -747,7 +864,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
             let mut if_capabilities = Vec::new();
             for region in current.regions() {
                 if let Some(sub_block) = region.first_block() {
-                    block_capabilities(sub_block, capability_map, &mut if_capabilities);
+                    block_capabilities(sub_block, capability_map, &mut if_capabilities, functions_by_name, parameters);
                 }
             }
             let if_capabilities = coalesce_capabilities(if_capabilities);
@@ -759,7 +876,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
             println!("[block_capabilities] collecting inner scf.for capabilities");
             let inner_block = current.first_region().unwrap().first_block().unwrap();
             let mut inner_capabilities = vec![];
-            block_capabilities(inner_block, capability_map, &mut inner_capabilities);
+            block_capabilities(inner_block, capability_map, &mut inner_capabilities, functions_by_name, parameters);
             println!(
                 "[block_capabilities] scf.for produced {} inner capabilities",
                 inner_capabilities.len()

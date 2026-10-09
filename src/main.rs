@@ -105,8 +105,8 @@ fn module_to_wavelet<'c>(module: Module<'c>) -> Result<Program<TypedVar>> {
             defs: Default::default()
         });
     };
-    let capability_map = compute_capabilities(&module);
-    for func in BlockIter::new(block) {
+    let capability_map = compute_capabilities(&module)?;
+    for func in functions_in_call_order(block)? {
         function_to_wavelet(func, &mut untyped_program, &capability_map);
     }
     
@@ -448,7 +448,15 @@ fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program
                         .expect("alloc_arrays must be an array<i64> attribute")
                 });
 
-            for (result_index, arr) in first_line.results().enumerate(){
+            let mut array_results: Vec<_> = first_line.results().enumerate().collect();
+            array_results.sort_by_key(|(result_index, _)| {
+                melior::ir::block::BlockArgument::try_from(
+                    first_line.operand(*result_index).unwrap(),
+                )
+                .expect("distinct_objects operands must be function parameters")
+                .argument_number()
+            });
+            for (result_index, arr) in array_results {
                 let value = arr.into();
                 let name = value_to_name(&value);
 

@@ -46,6 +46,9 @@ fn function_call_order_handles_forward_nested_repeated_and_self_calls() {
     let functions = super::functions_in_call_order(module.body()).unwrap();
     let names: Vec<_> = functions.iter().map(super::function_to_name).collect();
     assert_eq!(names, ["leaf", "middle", "caller"]);
+    // Calls in nested regions and self-calls must resolve through the shared lookup.
+    let capabilities = compute_capabilities(&module).unwrap();
+    assert_eq!(capabilities.len(), 4);
 }
 
 #[test]
@@ -94,6 +97,8 @@ fn function_call_order_rejects_mutual_recursion() {
     )
     .unwrap();
     let error = super::functions_in_call_order(module.body()).unwrap_err();
+    assert_eq!(error.to_string(), "mutual recursion is not supported");
+    let error = compute_capabilities(&module).unwrap_err();
     assert_eq!(error.to_string(), "mutual recursion is not supported");
 }
 
@@ -1540,6 +1545,408 @@ fn coalesce_capabilities_processes_each_array_independently() {
 }
 
 #[test]
+fn function_parameter_values_preserve_positions_with_reordered_distinct_arrays() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @test(%a0: memref<16xi32>, %n: index, %b0: memref<16xi32>, %v: i32) {
+                %b, %a = memref.distinct_objects %b0, %a0 : memref<16xi32>, memref<16xi32>
+                return
+            }
+        }
+    "#).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let distinct = body.first_operation().unwrap();
+    let parameters = super::capabilities::function_parameter_values(function);
+    assert_eq!(parameters.len(), 4);
+    assert_eq!(parameters[0], Value::from(distinct.result(1).unwrap()));
+    assert_eq!(parameters[1], Value::from(body.argument(1).unwrap()));
+    assert_eq!(parameters[2], Value::from(distinct.result(0).unwrap()));
+    assert_eq!(parameters[3], Value::from(body.argument(3).unwrap()));
+}
+
+#[test]
+fn call_capabilities_translate_reordered_arrays_and_scalar_parameters() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @wrapper(%x0: memref<16xi32>, %i: index, %y0: memref<16xi32>, %v: i32) -> i32 {
+                %x, %y = memref.distinct_objects %x0, %y0 : memref<16xi32>, memref<16xi32>
+                %result = func.call @callee(%x, %i, %y, %v) : (memref<16xi32>, index, memref<16xi32>, i32) -> i32
+                return %result : i32
+            }
+            func.func @callee(%a0: memref<16xi32>, %n: index, %b0: memref<16xi32>, %v: i32) -> i32 {
+                %b, %a = memref.distinct_objects %b0, %a0 : memref<16xi32>, memref<16xi32>
+                memref.store %v, %a[%n] : memref<16xi32>
+                %loaded = memref.load %b[%n] : memref<16xi32>
+                return %loaded : i32
+            }
+        }
+    "#).unwrap();
+    let wrapper = module.body().first_operation().unwrap();
+    let body = wrapper.first_region().unwrap().first_block().unwrap();
+    let distinct = body.first_operation().unwrap();
+    let i: Value<'_, '_> = body.argument(1).unwrap().into();
+    let map = compute_capabilities(&module).unwrap();
+    let caps = &map[&wrapper.to_raw().ptr];
+    assert_eq!(caps.len(), 2);
+    for (index, kind) in [(0, CapabilityType::Uniq), (1, CapabilityType::Shrd)] {
+        let array: Value<'_, '_> = distinct.result(index).unwrap().into();
+        let cap = caps.iter().find(|cap| cap.array == array).unwrap();
+        assert_eq!(cap.capability_type, kind);
+        let (start, end) = cap.capability_expr.as_ref().unwrap();
+        let expected = wavelet_elab::logic::semantic::Idx::Var(super::value_to_name(&i));
+        assert_eq!(start.to_wavelet_idx(), expected);
+        assert_eq!(end.to_wavelet_idx(), expected);
+    }
+
+    // Check the complete lowering and the serialized calls, not just capability analysis.
+    drop(map);
+    let lowered = super::module_to_wavelet(module).unwrap();
+    let source = super::program_to_wavelet(&lowered);
+    let parsed = wavelet_elab::parse_program(&source).unwrap();
+    let mut registry = wavelet_elab::FnRegistry::default();
+    for function in &parsed.defs {
+        registry.insert(function.clone());
+    }
+    let logic = wavelet_elab::SemanticLogic::default();
+    for function in &parsed.defs {
+        wavelet_elab::check::check_fn_with_options(
+            function,
+            &registry,
+            &logic,
+            wavelet_elab::check::CheckOptions::default(),
+        ).unwrap();
+    }
+}
+
+#[test]
+fn call_capabilities_expand_computed_arguments_into_parameters() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @forward(%j: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                func.call @wrapper(%j, %v, %a) : (index, i32, memref<16xi32>) -> ()
+                return
+            }
+            func.func @wrapper(%i: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                %one = arith.constant 1 : index
+                %next = arith.addi %i, %one : index
+                func.call @write(%next, %v, %a) : (index, i32, memref<16xi32>) -> ()
+                return
+            }
+            func.func @write(%n: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                memref.store %v, %a[%n] : memref<16xi32>
+                return
+            }
+        }
+    "#).unwrap();
+    let functions: Vec<_> = super::util::BlockIter::new(module.body()).collect();
+    let map = compute_capabilities(&module).unwrap();
+    for function in &functions[..2] {
+        let body = function.first_region().unwrap().first_block().unwrap();
+        let index: Value<'_, '_> = body.argument(0).unwrap().into();
+        let expected = wavelet_elab::logic::semantic::Idx::Add(
+            Box::new(wavelet_elab::logic::semantic::Idx::Var(super::value_to_name(&index))),
+            Box::new(wavelet_elab::logic::semantic::Idx::Const(1)),
+        );
+        let caps = &map[&function.to_raw().ptr];
+        assert_eq!(caps.len(), 1);
+        let (start, end) = caps[0].capability_expr.as_ref().unwrap();
+        assert_eq!(start.to_wavelet_idx(), expected);
+        assert_eq!(end.to_wavelet_idx(), expected);
+    }
+    drop(map);
+    let lowered = super::module_to_wavelet(module).unwrap();
+    let source = super::program_to_wavelet(&lowered);
+    assert_eq!(source.matches("uniq @ arg0 + 1..arg0 + 2").count(), 2);
+    let parsed = wavelet_elab::parse_program(&source).unwrap();
+    let mut registry = wavelet_elab::FnRegistry::default();
+    for function in &parsed.defs {
+        registry.insert(function.clone());
+    }
+    let logic = wavelet_elab::SemanticLogic::default();
+    for function in &parsed.defs {
+        wavelet_elab::check::check_fn_with_options(
+            function,
+            &registry,
+            &logic,
+            wavelet_elab::check::CheckOptions::default(),
+        ).unwrap();
+    }
+}
+
+#[test]
+fn call_capabilities_promote_through_loops_and_transitive_calls() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @outer(%a0: memref<4xi32>, %v: i32) {
+                %a = memref.distinct_objects %a0 : memref<4xi32>
+                %zero = arith.constant 0 : index
+                %one = arith.constant 1 : index
+                %four = arith.constant 4 : index
+                scf.for %i = %zero to %four step %one {
+                    func.call @wrapper(%i, %v, %a) : (index, i32, memref<4xi32>) -> ()
+                }
+                return
+            }
+            func.func @wrapper(%i: index, %v: i32, %a0: memref<4xi32>) {
+                %a = memref.distinct_objects %a0 : memref<4xi32>
+                func.call @write(%i, %v, %a) : (index, i32, memref<4xi32>) -> ()
+                return
+            }
+            func.func @write(%i: index, %v: i32, %a0: memref<4xi32>) {
+                %a = memref.distinct_objects %a0 : memref<4xi32>
+                memref.store %v, %a[%i] : memref<4xi32>
+                return
+            }
+        }
+    "#).unwrap();
+    let outer = module.body().first_operation().unwrap();
+    let map = compute_capabilities(&module).unwrap();
+    let caps = &map[&outer.to_raw().ptr];
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0].capability_type, CapabilityType::Uniq);
+    let (start, end) = caps[0].capability_expr.as_ref().unwrap();
+    assert_eq!(start.constant_propagate(), Some(0));
+    assert_eq!(end.constant_propagate(), Some(3));
+}
+
+#[test]
+fn call_capabilities_conservatively_cover_self_recursive_arrays() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @recursive(%a0: memref<4xi32>) {
+                %a = memref.distinct_objects %a0 : memref<4xi32>
+                func.call @recursive(%a) : (memref<4xi32>) -> ()
+                return
+            }
+        }
+    "#).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let array: Value<'_, '_> = body.first_operation().unwrap().result(0).unwrap().into();
+    let map = compute_capabilities(&module).unwrap();
+    let caps = &map[&function.to_raw().ptr];
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0].array, array);
+    assert_eq!(caps[0].capability_type, CapabilityType::Uniq);
+    assert!(caps[0].capability_expr.is_none());
+}
+
+#[test]
+fn capability_expr_substitute_is_simultaneous_and_matches_mlir_values() {
+    use wavelet_elab::ir::Signedness::{Signed, Unsigned};
+
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        "module { func.func @test(%x: index, %y: index, %z: index) { return } }",
+    ).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let x: Value<'_, '_> = body.argument(0).unwrap().into();
+    let y: Value<'_, '_> = body.argument(1).unwrap().into();
+    let z: Value<'_, '_> = body.argument(2).unwrap().into();
+    let expression = CapabilityExpr::BinOp {
+        operation: CapabilityOp::Add,
+        operands: (
+            Rc::new(CapabilityExpr::Variable { value: x, signedness: Signed }),
+            Rc::new(CapabilityExpr::BinOp {
+                operation: CapabilityOp::Mult,
+                operands: (
+                    Rc::new(CapabilityExpr::Blackbox { value: y, signedness: Signed }),
+                    Rc::new(CapabilityExpr::Blackbox { value: z, signedness: Signed }),
+                ),
+            }),
+        ),
+    };
+    let parameters = vec![x, y, z];
+    let substitutions = vec![
+        Some(CapabilityExpr::Variable { value: y, signedness: Unsigned }),
+        Some(CapabilityExpr::Constant(7)),
+        Some(CapabilityExpr::Blackbox { value: z, signedness: Signed }),
+    ];
+    let substituted = expression.substitute(&parameters, &substitutions).unwrap().unwrap();
+    let CapabilityExpr::BinOp { operation, operands } = &substituted else {
+        panic!("expected addition");
+    };
+    assert_eq!(*operation, CapabilityOp::Add);
+    assert!(matches!(operands.0.as_ref(), CapabilityExpr::Variable { value, signedness: Unsigned } if *value == y));
+    let CapabilityExpr::BinOp { operation, operands } = operands.1.as_ref() else {
+        panic!("expected multiplication");
+    };
+    assert_eq!(*operation, CapabilityOp::Mult);
+    assert!(matches!(operands.0.as_ref(), CapabilityExpr::Constant(7)));
+    assert!(matches!(operands.1.as_ref(), CapabilityExpr::Blackbox { value, signedness: Signed } if *value == z));
+    assert_eq!(expression.substitute(&[], &[]).unwrap().unwrap().to_wavelet_idx(), expression.to_wavelet_idx());
+    assert_eq!(CapabilityExpr::Constant(3).substitute(&parameters, &substitutions).unwrap().unwrap().constant_propagate(), Some(3));
+    assert!(expression.substitute(&parameters, &substitutions[..2]).is_err());
+}
+
+#[test]
+fn capability_substitute_remaps_arrays_and_both_bounds_and_preserves_poison() {
+    use wavelet_elab::ir::Signedness::Signed;
+
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        "module { func.func @test(%a: memref<16xi32>, %b: memref<16xi32>, %x: index, %y: index) { return } }",
+    ).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let a: Value<'_, '_> = body.argument(0).unwrap().into();
+    let b: Value<'_, '_> = body.argument(1).unwrap().into();
+    let x: Value<'_, '_> = body.argument(2).unwrap().into();
+    let y: Value<'_, '_> = body.argument(3).unwrap().into();
+    let replacement = CapabilityExpr::BinOp {
+        operation: CapabilityOp::Add,
+        operands: (
+            Rc::new(CapabilityExpr::Variable { value: y, signedness: Signed }),
+            Rc::new(CapabilityExpr::Constant(1)),
+        ),
+    };
+    let parameters = vec![a, b, x];
+    let substitutions = vec![
+        Some(CapabilityExpr::Blackbox { value: b, signedness: Signed }),
+        Some(CapabilityExpr::Blackbox { value: a, signedness: Signed }),
+        Some(replacement.clone()),
+    ];
+    for capability_type in [CapabilityType::Shrd, CapabilityType::Uniq] {
+        let capability = Capability {
+            array: a,
+            capability_type,
+            capability_expr: Some((
+                CapabilityExpr::Blackbox { value: x, signedness: Signed },
+                CapabilityExpr::Variable { value: x, signedness: Signed },
+            )),
+        };
+        let substituted = capability.substitute(&parameters, &substitutions).unwrap();
+        assert_eq!(substituted.array, b);
+        assert_eq!(substituted.capability_type, capability_type);
+        let (start, end) = substituted.capability_expr.unwrap();
+        assert_eq!(start.to_wavelet_idx(), replacement.to_wavelet_idx());
+        assert_eq!(end.to_wavelet_idx(), replacement.to_wavelet_idx());
+        assert_eq!(capability.array, a);
+        assert_eq!(capability.substitute(&[], &[]).unwrap().array, a);
+        assert!(capability.substitute(&parameters, &substitutions[..2]).is_err());
+
+        let poisoned = Capability { capability_expr: None, ..capability };
+        let substituted = poisoned.substitute(&parameters, &substitutions).unwrap();
+        assert_eq!(substituted.array, b);
+        assert_eq!(substituted.capability_type, capability_type);
+        assert!(substituted.capability_expr.is_none());
+        assert!(poisoned.substitute(&[a], &[Some(CapabilityExpr::Constant(0))]).is_err());
+        assert!(poisoned.substitute(&[a], &[Some(replacement.clone())]).is_err());
+        assert!(poisoned.substitute(&[a], &[Some(CapabilityExpr::Blackbox { value: x, signedness: Signed })]).is_err());
+        assert!(poisoned.substitute(&[a], &[None]).is_err());
+    }
+}
+
+#[test]
+fn capability_substitute_poisons_only_bounds_using_unknown_parameters() {
+    use wavelet_elab::ir::Signedness::Signed;
+
+    let context = test_context();
+    let module = Module::parse(&context,
+        "module { func.func @test(%a: memref<16xi32>, %b: memref<16xi32>, %n: index, %m: index) { return } }",
+    ).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let parameters: Vec<Value<'_, '_>> = (0..4)
+        .map(|index| body.argument(index).unwrap().into()).collect();
+    let value = |value| CapabilityExpr::Blackbox { value, signedness: Signed };
+    let substitutions = vec![
+        Some(value(parameters[0])), Some(value(parameters[1])), None,
+        Some(value(parameters[3])),
+    ];
+    let unknown_bound = bin_op(CapabilityOp::Add,
+        value(parameters[2]), CapabilityExpr::Constant(1));
+    assert!(unknown_bound.substitute(&parameters, &substitutions).unwrap().is_none());
+    assert_eq!(CapabilityExpr::Constant(3).substitute(&parameters, &substitutions)
+        .unwrap().unwrap().constant_propagate(), Some(3));
+
+    for kind in [CapabilityType::Shrd, CapabilityType::Uniq] {
+        for bounds in [
+            (unknown_bound.clone(), CapabilityExpr::Constant(15)),
+            (CapabilityExpr::Constant(0), unknown_bound.clone()),
+        ] {
+            let affected = Capability {
+                array: parameters[0], capability_type: kind, capability_expr: Some(bounds),
+            }.substitute(&parameters, &substitutions).unwrap();
+            assert_eq!(affected.array, parameters[0]);
+            assert_eq!(affected.capability_type, kind);
+            assert!(affected.capability_expr.is_none());
+        }
+        let unaffected = Capability {
+            array: parameters[1], capability_type: kind,
+            capability_expr: Some((CapabilityExpr::Constant(0), value(parameters[3]))),
+        }.substitute(&parameters, &substitutions).unwrap();
+        assert_eq!(unaffected.array, parameters[1]);
+        assert_eq!(unaffected.capability_type, kind);
+        let (start, end) = unaffected.capability_expr.unwrap();
+        assert_eq!(start.constant_propagate(), Some(0));
+        assert_eq!(end.to_wavelet_idx(), value(parameters[3]).to_wavelet_idx());
+    }
+}
+
+#[test]
+fn call_capabilities_keep_precise_bounds_when_only_the_stored_value_is_unknown() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @copy_four(%src0: memref<16xi32>, %dst0: memref<16xi32>) {
+                %src, %dst = memref.distinct_objects %src0, %dst0 : memref<16xi32>, memref<16xi32>
+                %zero = arith.constant 0 : index
+                %one = arith.constant 1 : index
+                %four = arith.constant 4 : index
+                scf.for %i = %zero to %four step %one {
+                    %v = memref.load %src[%i] : memref<16xi32>
+                    func.call @write(%i, %v, %dst) : (index, i32, memref<16xi32>) -> ()
+                }
+                return
+            }
+            func.func @write(%n: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                memref.store %v, %a[%n] : memref<16xi32>
+                return
+            }
+        }
+    "#).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let destination: Value<'_, '_> = body.first_operation().unwrap().result(1).unwrap().into();
+    let map = compute_capabilities(&module).unwrap();
+    let destination_cap = map[&function.to_raw().ptr].iter()
+        .find(|cap| cap.array == destination).unwrap();
+    assert_eq!(destination_cap.capability_type, CapabilityType::Uniq);
+    let (start, end) = destination_cap.capability_expr.as_ref().unwrap();
+    assert_eq!(start.constant_propagate(), Some(0));
+    assert_eq!(end.constant_propagate(), Some(3));
+    drop(map);
+    let lowered = super::module_to_wavelet(module).unwrap();
+    assert_eq!(lowered.defs.first().unwrap().name.0, "write");
+    assert_eq!(lowered.defs.last().unwrap().name.0, "copy_four");
+    let parsed = wavelet_elab::parse_program(&super::program_to_wavelet(&lowered)).unwrap();
+    let mut registry = wavelet_elab::FnRegistry::default();
+    for function in &parsed.defs {
+        registry.insert(function.clone());
+    }
+    let logic = wavelet_elab::SemanticLogic::default();
+    for function in &parsed.defs {
+        wavelet_elab::check::check_fn_with_options(
+            function, &registry, &logic, wavelet_elab::check::CheckOptions::default(),
+        ).unwrap();
+    }
+}
+
+#[test]
 fn compute_capabilities_coalesces_if_and_function_capabilities() {
     let context = test_context();
     let module = Module::parse(
@@ -1566,7 +1973,7 @@ fn compute_capabilities_coalesces_if_and_function_capabilities() {
         .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.if")
         .unwrap();
 
-    let capability_map = compute_capabilities(&module);
+    let capability_map = compute_capabilities(&module).unwrap();
     let if_capabilities = &capability_map[&if_operation.to_raw().ptr];
     let function_capabilities = &capability_map[&function.to_raw().ptr];
 
@@ -1601,7 +2008,7 @@ fn block_capabilities_coalesces_loop_before_lower_bound_substitution() {
         .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
         .unwrap();
 
-    let capability_map = compute_capabilities(&module);
+    let capability_map = compute_capabilities(&module).unwrap();
     let loop_capabilities = &capability_map[&for_loop.to_raw().ptr];
     let function_capabilities = &capability_map[&function.to_raw().ptr];
 
@@ -1647,7 +2054,7 @@ fn block_capabilities_promotes_loop_access_and_finds_parent_iterator() {
 
     let mut capabilities = vec![];
     let mut capability_map = HashMap::new();
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
@@ -1921,7 +2328,7 @@ fn block_to_wavelet_outlines_a_non_tail_if() {
     let if_statement = block.first_operation().unwrap();
     let mut capability_map = HashMap::new();
     let mut capabilities = Vec::new();
-    block_capabilities(block, &mut capability_map, &mut capabilities);
+    block_capabilities(block, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
     let mut program = wavelet_elab::Program::new();
 
     let expression = super::block_to_wavelet(
@@ -1978,7 +2385,7 @@ fn block_capabilities_tracks_increasing_and_decreasing_unique_loop_caps() {
     let mut capability_map = HashMap::new();
     let mut capabilities = Vec::new();
 
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     let increasing = capability_map.get(&loops[0].to_raw().ptr).unwrap();
     println!(
@@ -2034,7 +2441,7 @@ fn block_capabilities_keeps_poison_for_loop_caps_poisoned() {
     let mut capability_map = HashMap::new();
     let mut capabilities = Vec::new();
 
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     let loop_capabilities = capability_map.get(&for_loop.to_raw().ptr).unwrap();
     println!(
@@ -2078,7 +2485,7 @@ fn block_capabilities_handles_flattened_2d_array_access() {
     let mut capabilities = vec![];
 
     let mut capability_map = HashMap::new();
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
@@ -2096,7 +2503,7 @@ fn block_capabilities_handles_nested_quadratic_access() {
     let mut capabilities = vec![];
 
     let mut capability_map = HashMap::new();
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Uniq);
@@ -2132,7 +2539,7 @@ fn block_capabilities_handles_increasing_then_decreasing_accesses() {
     let mut capabilities = vec![];
 
     let mut capability_map = HashMap::new();
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     assert_eq!(capabilities.len(), 2);
     for capability in &capabilities {
@@ -2176,7 +2583,7 @@ fn block_capabilities_handles_increasing_intervals_with_decreasing_indices() {
     let mut capabilities = vec![];
 
     let mut capability_map = HashMap::new();
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
@@ -2218,7 +2625,7 @@ fn block_capabilities_handles_decreasing_intervals_with_increasing_indices() {
     let mut capabilities = vec![];
 
     let mut capability_map = HashMap::new();
-    block_capabilities(body, &mut capability_map, &mut capabilities);
+    block_capabilities(body, &mut capability_map, &mut capabilities, &HashMap::new(), &[]);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
