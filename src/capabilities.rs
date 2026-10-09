@@ -703,6 +703,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
         let ident = current.name();
         let name = ident.as_string_ref().as_str().unwrap();
         println!("[block_capabilities] visiting {name}");
+        
         if name == "memref.load" {
             let array = current.operand(0).unwrap();
             let idx = current.operand(1).unwrap();

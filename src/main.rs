@@ -1,8 +1,10 @@
-use std::{assert_eq, collections::{HashMap, HashSet}, env, error::Error, ffi::c_void, fs, io, vec};
+use std::{assert_eq, collections::{HashMap, HashSet, VecDeque}, env, ffi::c_void, fs, vec};
+
+use anyhow::{Context as _, Result, anyhow};
 
 use melior::{
     Context, IrRewriter, dialect::DialectRegistry, ir::{
-        BlockLike, BlockRef, Module, OperationRef, Region, RegionLike, RegionRef, ShapedTypeLike, Type, TypeLike, Value, ValueLike, attribute::{BoolAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute}, operation::{OperationLike, OperationResult}, r#type::{DimSize, FunctionType, IntegerType, MemRefType},
+        BlockLike, BlockRef, Module, OperationRef, Region, RegionLike, RegionRef, ShapedTypeLike, Type, TypeLike, Value, ValueLike, attribute::{BoolAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute}, operation::{OperationLike, OperationResult, WalkOrder, WalkResult}, r#type::{DimSize, FunctionType, IntegerType, MemRefType},
     }, utility::register_all_dialects,
 };
 mod capabilities;
@@ -16,24 +18,105 @@ use capabilities::print_return_expressions;
 use wavelet_elab::{Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
 use crate::{capabilities::{Capability, capability_constants, compute_capabilities, constant_fold_value, generate_expr, to_wavelet_capability}, program_to_wavelet::program_to_wavelet, rename_variables::rename_program_variables, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
-fn module_to_wavelet<'c>(module: Module<'c>) -> Program<TypedVar> {
+
+/// Returns functions with every non-self callee before its callers.
+fn functions_in_call_order<'c, 'a>(block: BlockRef<'c, 'a>) -> Result<Vec<OperationRef<'c, 'a>>> {
+    let functions: Vec<_> = BlockIter::new(block).collect();
+    let mut names = Vec::new();
+    let mut function_indices = HashMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        if function.name().as_string_ref().as_str()? != "func.func" {
+            return Err(anyhow!("expected a function, found {function}"));
+        }
+        let name = StringAttribute::try_from(function.attribute("sym_name")?)?
+            .value()
+            .to_owned();
+        if function_indices.insert(name.clone(), index).is_some() {
+            return Err(anyhow!("duplicate function symbol '{name}'"));
+        }
+        names.push(name);
+    }
+
+    let mut remaining_callees = vec![0; functions.len()];
+    let mut callers = vec![Vec::new(); functions.len()];
+    for (caller, function) in functions.iter().enumerate() {
+        let mut callees = HashSet::new();
+        let mut walk_error = None;
+        function.walk(WalkOrder::PreOrder, |operation| {
+            let result = (|| -> Result<()> {
+                if operation.name().as_string_ref().as_str()? != "func.call" {
+                    return Ok(());
+                }
+                let callee = FlatSymbolRefAttribute::try_from(operation.attribute("callee")?)?;
+                let name = callee.value();
+                let callee = *function_indices.get(name).ok_or_else(|| {
+                    anyhow!("function '{}' calls unknown function '{name}'", names[caller])
+                })?;
+                // Self-recursion does not impose an ordering between functions.
+                if callee != caller {
+                    callees.insert(callee);
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => WalkResult::Advance,
+                Err(error) => {
+                    walk_error = Some(error);
+                    WalkResult::Interrupt
+                }
+            }
+        });
+        if let Some(error) = walk_error {
+            return Err(error);
+        }
+        remaining_callees[caller] = callees.len();
+        for callee in callees {
+            callers[callee].push(caller);
+        }
+    }
+
+    let mut ready: VecDeque<_> = remaining_callees
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect();
+    let mut ordered = Vec::with_capacity(functions.len());
+    while let Some(callee) = ready.pop_front() {
+        ordered.push(functions[callee]);
+        for &caller in &callers[callee] {
+            remaining_callees[caller] -= 1;
+            if remaining_callees[caller] == 0 {
+                ready.push_back(caller);
+            }
+        }
+    }
+    if ordered.len() != functions.len() {
+        return Err(anyhow!("mutual recursion is not supported"));
+    }
+    Ok(ordered)
+}
+
+fn module_to_wavelet<'c>(module: Module<'c>) -> Result<Program<TypedVar>> {
     let moduleref = module.as_operation();
     let mut untyped_program = Program { defs: Vec::new() };
 
     let Some(block) = moduleref.first_region().unwrap().first_block() else {
-        return Program{
+        return Ok(Program {
             defs: Default::default()
-        };
+        });
     };
+    let functions = functions_in_call_order(block)?;
     let capability_map = compute_capabilities(&module);
-    for func in BlockIter::new(block){
+    for func in functions {
         function_to_wavelet(func, &mut untyped_program, &capability_map);
     }
-    let mut program = type_program::type_program(&untyped_program).unwrap();
+    
+    let mut program = type_program::type_program(&untyped_program)
+        .context("failed to type-check generated Wavelet program")?;
     rename_program_variables(&mut program);
     
     fence_placement::place_fences(&mut program);
-    program
+    Ok(program)
 }
 
 
@@ -614,6 +697,10 @@ fn if_to_wavelet<'c, 'a>(
     }
 }
 fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: &HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Stmt<UntypedVar>{
+    if for_loop.attribute("unsignedCmp").is_ok() {
+        panic!("unsigned for loops are not supported");
+    }
+
     let block = for_loop
         .first_region()
         .unwrap()
@@ -851,22 +938,17 @@ fn block_to_wavelet<'c, 'a>(
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     let mut args = env::args_os();
     let _ = args.next();
-    let input_path = args.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: scftowavelet <input.mlir> <output.mlir>",
-        )
-    })?;
-    let output_path = args.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: scftowavelet <input.mlir> <output.mlir>",
-        )
-    })?;
-    let source = fs::read_to_string(&input_path)?;
+    let input_path = args
+        .next()
+        .ok_or_else(|| anyhow!("usage: scftowavelet <input.mlir> <output.mlir>"))?;
+    let output_path = args
+        .next()
+        .ok_or_else(|| anyhow!("usage: scftowavelet <input.mlir> <output.mlir>"))?;
+    let source = fs::read_to_string(&input_path)
+        .with_context(|| format!("failed to read {}", input_path.to_string_lossy()))?;
 
     let registry = DialectRegistry::new();
     register_all_dialects(&registry);
@@ -876,13 +958,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         context.get_or_load_dialect(dialect);
     }
 
-    let mut module = Module::parse(&context, &source).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "failed to parse MLIR file: {}",
-                input_path.to_string_lossy()
-            ),
+    let module = Module::parse(&context, &source).ok_or_else(|| {
+        anyhow!(
+            "failed to parse MLIR file: {}",
+            input_path.to_string_lossy()
         )
     })?;
 
@@ -897,10 +976,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // function_to_wavelet(func, &mut program, &cap_map);
     // rename_program_variables(&mut program);
 
-    let mut wavelet_program = module_to_wavelet(module);
+    let wavelet_program = module_to_wavelet(module)?;
     let output_program = program_to_wavelet(&wavelet_program);
 
-    fs::write(output_path, output_program)?;
+    fs::write(&output_path, output_program)
+        .with_context(|| format!("failed to write {}", output_path.to_string_lossy()))?;
     // if !module.as_operation().verify() {
     //     println!("failed to verify");
     // }

@@ -3,7 +3,7 @@ use std::{collections::HashMap, rc::Rc};
 use melior::{
     Context,
     dialect::DialectRegistry,
-    ir::{BlockLike, Module, RegionLike, Value, ValueLike, operation::OperationLike},
+    ir::{BlockLike, Module, RegionLike, Value, ValueLike, operation::{OperationLike, OperationMutLike}},
     utility::register_all_dialects,
 };
 
@@ -13,6 +13,117 @@ use super::capabilities::{
     compute_capabilities, find_parent_iterator, format_capabilities, generate_expr, z3_assumptions,
     z3_for_loop_viability,
 };
+
+#[test]
+fn function_call_order_handles_forward_nested_repeated_and_self_calls() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @caller(%condition: i1) {
+                    scf.if %condition {
+                        func.call @middle() : () -> ()
+                    } else {
+                        func.call @middle() : () -> ()
+                    }
+                    func.call @leaf() : () -> ()
+                    return
+                }
+                func.func @middle() {
+                    func.call @middle() : () -> ()
+                    func.call @leaf() : () -> ()
+                    return
+                }
+                func.func @leaf() {
+                    return
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let functions = super::functions_in_call_order(module.body()).unwrap();
+    let names: Vec<_> = functions.iter().map(super::function_to_name).collect();
+    assert_eq!(names, ["leaf", "middle", "caller"]);
+}
+
+#[test]
+fn function_call_order_handles_empty_and_disconnected_modules() {
+    let context = test_context();
+    let empty = Module::parse(&context, "module {}").unwrap();
+    assert!(super::functions_in_call_order(empty.body()).unwrap().is_empty());
+
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @first() { return }
+                func.func private @external()
+                func.func @last() { return }
+            }
+        "#,
+    )
+    .unwrap();
+    let functions = super::functions_in_call_order(module.body()).unwrap();
+    let names: Vec<_> = functions.iter().map(super::function_to_name).collect();
+    assert_eq!(names, ["first", "external", "last"]);
+}
+
+#[test]
+fn function_call_order_rejects_mutual_recursion() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @first() {
+                    func.call @second() : () -> ()
+                    return
+                }
+                func.func @second() {
+                    func.call @third() : () -> ()
+                    return
+                }
+                func.func @third() {
+                    func.call @first() : () -> ()
+                    return
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let error = super::functions_in_call_order(module.body()).unwrap_err();
+    assert_eq!(error.to_string(), "mutual recursion is not supported");
+    assert!(super::module_to_wavelet(module).is_err());
+}
+
+#[test]
+fn function_call_order_rejects_unknown_callees() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @caller() {
+                    func.call @caller() : () -> ()
+                    return
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    // Parsing verifies symbol references, so introduce the missing symbol afterward.
+    let caller = module.body().first_operation().unwrap();
+    let body = caller.first_region().unwrap().first_block().unwrap();
+    let mut call = body.first_operation_mut().unwrap();
+    call.set_attribute(
+        "callee",
+        melior::ir::attribute::FlatSymbolRefAttribute::new(&context, "missing").into(),
+    );
+    let error = super::functions_in_call_order(module.body()).unwrap_err();
+    assert_eq!(error.to_string(), "function 'caller' calls unknown function 'missing'");
+}
 
     fn test_context() -> Context {
     let registry = DialectRegistry::new();
@@ -966,6 +1077,28 @@ fn generate_expr_uses_scf_for_unsigned_keyword_for_variable_signedness() {
             if value.to_raw().ptr == outside.to_raw().ptr
                 && signedness == wavelet_elab::ir::Signedness::Signed
     ));
+}
+
+#[test]
+#[should_panic(expected = "unsigned for loops are not supported")]
+fn module_to_wavelet_rejects_unsigned_for_loops() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @test(%lower: i32, %upper: i32, %step: i32) {
+                    scf.for unsigned %i = %lower to %upper step %step : i32 {
+                        scf.yield
+                    }
+                    return
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let _ = super::module_to_wavelet(module);
 }
 
 #[test]

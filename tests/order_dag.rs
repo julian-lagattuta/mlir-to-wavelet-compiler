@@ -111,11 +111,10 @@ mod implementation {
     }
 
     fn ordered_labels(stmts: &[Stmt<TypedVar>]) -> Vec<String> {
-        order_dag(
-            stmts_to_dag(stmts, &HashMap::new(), HashMap::new(), None),
-            &Bool::from_bool(true),
-            &HashMap::new(),
-        )
+        let dag = stmts_to_dag(stmts, &HashMap::new(), HashMap::new(), None);
+        let code_as_z3: Vec<_> = dag.nodes.iter().filter_map(|node| node.to_z3()).collect();
+        let assumptions = bool_and_or_true(&code_as_z3);
+        order_dag(dag, &assumptions, &HashMap::new())
             .into_iter()
             .map(|item| match item {
                 FenceOrNode::Fence => "fence".to_owned(),
@@ -130,16 +129,15 @@ mod implementation {
         tail_args: &[TypedVar],
         functions: &HashMap<String, FnDef<TypedVar>>,
     ) -> Vec<String> {
-        order_dag(
-            stmts_to_dag(
-                stmts,
-                functions,
-                HashMap::new(),
-                Some((tail_function, tail_args)),
-            ),
-            &Bool::from_bool(true),
+        let dag = stmts_to_dag(
+            stmts,
             functions,
-        )
+            HashMap::new(),
+            Some((tail_function, tail_args)),
+        );
+        let code_as_z3: Vec<_> = dag.nodes.iter().filter_map(|node| node.to_z3()).collect();
+        let assumptions = bool_and_or_true(&code_as_z3);
+        order_dag(dag, &assumptions, functions)
         .into_iter()
         .map(|item| match item {
             FenceOrNode::Fence => "fence".to_owned(),
@@ -484,6 +482,59 @@ mod implementation {
         ));
     }
 
+    fn parent_scalar_definitions_are_available_in_branches() {
+        let output = array("output");
+        let parent_index = int("parent_index");
+        let child_index = int("child_index");
+        let value = int("value");
+        let condition = TypedVar::new("condition", Ty::Bool);
+        let loaded = int("loaded");
+        let mut expr = Expr {
+            stmts: vec![
+                let_int(&parent_index, 0),
+                let_int(&child_index, 1),
+                let_int(&value, 7),
+                Stmt::LetVal {
+                    var: condition.clone(),
+                    val: Val::Bool(true),
+                    fence: false,
+                },
+                store(&output, &parent_index, &value),
+            ],
+            tail: Tail::IfElse {
+                cond: condition,
+                then_e: Box::new(Expr {
+                    stmts: vec![load(&loaded, &output, &child_index)],
+                    tail: Tail::RetVar(loaded),
+                }),
+                else_e: Box::new(Expr {
+                    stmts: Vec::new(),
+                    tail: Tail::RetVar(value),
+                }),
+            },
+        };
+
+        place_fences_expr(
+            &mut expr,
+            &Bool::from_bool(true),
+            HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let Tail::IfElse { then_e, .. } = expr.tail else {
+            panic!("expected if tail")
+        };
+        assert_eq!(then_e.stmts.len(), 1);
+        assert!(matches!(
+            then_e.stmts.first(),
+            Some(Stmt::LetOp {
+                op: Op::Load { .. },
+                fence: false,
+                ..
+            })
+        ));
+    }
+
     fn empty_body_can_emit_a_fence_before_its_tail_call() {
         let output = array("output");
         let index = int("index");
@@ -539,6 +590,7 @@ mod implementation {
             "tail_conflict" => conflicting_tail_call_is_terminal_and_fenced(),
             "tail_substitution" => scalar_call_arguments_are_substituted_in_capabilities(),
             "branch_initial" => unfenced_parent_accesses_are_propagated_into_branches(),
+            "branch_scalar_definitions" => parent_scalar_definitions_are_available_in_branches(),
             "empty_tail_fence" => empty_body_can_emit_a_fence_before_its_tail_call(),
             _ => panic!("unknown order_dag test case {case:?}"),
         }
@@ -711,6 +763,11 @@ fn substitutes_scalar_arguments_in_tail_call_capabilities() {
 #[test]
 fn propagates_unfenced_accesses_into_branches() {
     run_case("branch_initial");
+}
+
+#[test]
+fn propagates_parent_scalar_definitions_into_branches() {
+    run_case("branch_scalar_definitions");
 }
 
 #[test]

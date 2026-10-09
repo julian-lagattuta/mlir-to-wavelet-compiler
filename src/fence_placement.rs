@@ -305,7 +305,6 @@ impl Node {
                     Op::Add => Some(Int::add(&[&lhs_value, &rhs_value])),
                     Op::Sub => Some(Int::sub(&[&lhs_value, &rhs_value])),
                     Op::Mul => Some(Int::mul(&[&lhs_value, &rhs_value])),
-                    Op::Sdiv | Op::Udiv => Some(lhs_value.div(rhs_value)),
                     _ => None,
                 }?;
                 Some(result.eq(value))
@@ -605,15 +604,12 @@ enum FenceOrNode{
     Node(Rc<Node>)
 }
 fn place_dependencies(
-    nodes: &[Rc<Node>],
     read_write_order: &HashMap<String, Vec<Rc<Node>>>,
     assumptions: &Bool,
     functions: &HashMap<String, FnDef<TypedVar>>,
 ) {
     let solver = Solver::new();
     solver.assert(assumptions);
-    let code_as_z3: Vec<Bool> = nodes.iter().map(|f| f.to_z3()).filter_map(|f| f).collect();
-    solver.assert(bool_and_or_true(&code_as_z3));
     for (array_name, access_order) in read_write_order.iter(){
         for i in 0..access_order.len(){
             for j in i+1..access_order.len(){
@@ -648,7 +644,7 @@ fn order_dag(dag: Dag, assumptions: &Bool, functions: &HashMap<String, FnDef<Typ
         read_write_order,
     } = dag;
 
-    place_dependencies(&nodes, &read_write_order, assumptions, functions);
+    place_dependencies(&read_write_order, assumptions, functions);
 
     let mut dependency_counts: HashMap<*const Node, usize> = nodes
         .iter()
@@ -784,14 +780,17 @@ fn place_fences_expr(
         initial_capabilities,
         tail_call,
     );
-    let order = order_dag(dag, assumptions, functions);
+    let code_as_z3: Vec<_> = dag.nodes.iter().filter_map(|node| node.to_z3()).collect();
+    let code_as_z3 = bool_and_or_true(&code_as_z3);
+    let assumptions = Bool::and(&[assumptions, &code_as_z3]);
+    let order = order_dag(dag, &assumptions, functions);
     expr.stmts = order_to_stmts(&order);
     match &mut expr.tail{
         wavelet_elab::Tail::IfElse { cond, then_e, else_e } => {
             let initial_capabilities = calculate_initial_capabilities(&order, functions);
-            let true_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone())]);
+            let true_assumptions = Bool::and(&[&assumptions, &Bool::new_const(cond.name.clone())]);
             place_fences_expr(then_e, &true_assumptions, initial_capabilities.clone(),functions);
-            let false_assumptions = Bool::and(&[assumptions, &Bool::new_const(cond.name.clone()).not()]);
+            let false_assumptions = Bool::and(&[&assumptions, &Bool::new_const(cond.name.clone()).not()]);
             place_fences_expr(else_e, &false_assumptions, initial_capabilities, functions);
         },
         wavelet_elab::Tail::TailCall { .. } => {}
