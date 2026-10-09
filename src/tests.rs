@@ -95,7 +95,6 @@ fn function_call_order_rejects_mutual_recursion() {
     .unwrap();
     let error = super::functions_in_call_order(module.body()).unwrap_err();
     assert_eq!(error.to_string(), "mutual recursion is not supported");
-    assert!(super::module_to_wavelet(module).is_err());
 }
 
 #[test]

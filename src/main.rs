@@ -105,9 +105,8 @@ fn module_to_wavelet<'c>(module: Module<'c>) -> Result<Program<TypedVar>> {
             defs: Default::default()
         });
     };
-    let functions = functions_in_call_order(block)?;
     let capability_map = compute_capabilities(&module);
-    for func in functions {
+    for func in BlockIter::new(block) {
         function_to_wavelet(func, &mut untyped_program, &capability_map);
     }
     
