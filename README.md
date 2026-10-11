@@ -12,7 +12,7 @@ An experimental Rust compiler that translates a subset of LLVM MLIR into Wavelet
 5. Insert fences and capability guards using Z3 reasoning.
 6. Serialize the program as Wavelet source.
 
-## Supported input
+## Supported input 
 
 The translator handles a restricted subset of MLIR:
 
@@ -22,6 +22,6 @@ The translator handles a restricted subset of MLIR:
 - `memref.load` and `memref.store` on statically sized, one-dimensional arrays.
 - `memref.distinct_objects` for function array parameters.
 
-Functions with array parameters should begin with `memref.distinct_objects`, as shown in `basic.mlir`, and use the resulting values for accesses. Its optional `alloc_arrays` attribute identifies array results treated as allocated arrays.
+Functions with array parameters should begin with `memref.distinct_objects`, as shown in `basic.mlir`, and use the resulting values for accesses.
 
-`index` and signless/signed integer types map to Wavelet signed integers; unsigned integers map to unsigned integers; `i1` maps to Boolean. Integer widths are not preserved as distinct Wavelet types.
+`index` and signless/signed integer types map to Wavelet signed integers; unsigned integers map to unsigned integers; `i1` maps to Boolean.
