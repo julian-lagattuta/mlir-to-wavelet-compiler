@@ -1,6 +1,8 @@
 # LLVM MLIR Wavelet Compiler
 
-An experimental Rust compiler that translates a subset of LLVM MLIR into Wavelet source. It lowers SCF into Wavelet functions, infers array capabilities, inserts fences, and adds guards for accesses and calls whose required capabilities cannot be proved available.
+An experimental Rust compiler that translates a subset of LLVM MLIR into [Wavelet source](https://github.com/plum-umd/wavelet). It lowers SCF into Wavelet functions, infers array capabilities, inserts fences, and adds guards for accesses and calls whose required capabilities cannot be proved available.
+
+[Wavelet paper](https://lz.gy/papers/wavelet.pdf)
 
 ## Wavelet dependency
 
@@ -30,14 +32,62 @@ cargo run --manifest-path vendor/wavelet/Cargo.toml -- --help
 
 ## Supported input 
 
-The translator handles a restricted subset of MLIR:
+- `func.func`, `func.call`, `func.return`
+  - Cannot return more than one item.
+- `scf.if`, `scf.for`, `scf.yield`
+  - Cannot yield more than one item.
+- `arith`
+  - `arith.constant`, `arith.addi`, `arith.subi`, `arith.muli`, `arith.divsi`, `arith.divui`, `arith.cmpi`, `arith.andi`, `arith.ori`, `arith.xori`, `arith.shli`, `arith.shrsi`, `arith.shrui`
+- `memref.load`
+- `memref.store`
+- `memref.distinct_objects`
+    - Placed at the beginning of functions to state disjointness of arrays
 
-- `func.func`, `func.call`, and `func.return`.
-- `scf.for`, `scf.if`, and `scf.yield`, with at most one loop-carried value or conditional result.
-- Integer and Boolean constants; integer addition, subtraction, multiplication, signed and unsigned division, comparisons, bitwise operations, and shifts.
-- `memref.load` and `memref.store` on statically sized, one-dimensional arrays.
-- `memref.distinct_objects` for function array parameters.
+## Input restrictions
 
-Functions with array parameters should begin with `memref.distinct_objects`, as shown in `basic.mlir`, and use the resulting values for accesses.
+- All `index` values are treated as **signed**.
+- Tuples cannot be returned from `scf.if`, `scf.for`, functions, or other constructs. Functions return at most one value, and loops carry at most one `iter_args` value.
+- Return statements must be at the top level of the function.
+- Function names must be valid Wavelet identifiers. For example, names cannot contain periods.
+- `memref` types must be one-dimensional and have a fixed size.
+- The first statement of every function with array parameters must declare their disjointness using `memref.distinct_objects`, even if there is only one array. Only the arrays returned by that statement may be accessed.
 
-`index` and signless/signed integer types map to Wavelet signed integers; unsigned integers map to unsigned integers; `i1` maps to Boolean.
+For example:
+
+```mlir
+func.func @f(%a0: memref<16xi32>, %n: index, %b0: memref<16xi32>) {
+  %b, %a = memref.distinct_objects %b0, %a0 : memref<16xi32>, memref<16xi32>
+  return
+}
+```
+
+## Limitations
+
+- All integer types are treated as 32-bit integers, regardless of their declared width. `i1` is treated as Boolean.
+- Mutual recursion is not supported. Only tail recursion is supported.
+- Out-of-bounds accesses may cause the compiler to generate permissions that exceed the array's bounds. The Wavelet ghost checker rejects such programs.
+
+If there is an unknown index, it is forced to fall within the array bounds.
+
+```rust
+#[cap(a: uniq @ 0..10)]
+fn func(a: &mut [usize; 10]) {
+    let z = blackbox();
+    a[z] = z;
+}
+```
+becomes
+```rust
+#[cap(a: uniq @ 0..10)]
+fn func(a: &mut [usize; 10]) {
+    let z = blackbox();
+    let _c0 = z>=0;
+    let _c1 = z<10;
+    let _c2= _c0 && _c1;
+    if _c2{
+        a[z] = z;
+    }else{
+        ()
+    }
+}
+```
