@@ -11,6 +11,7 @@ This project requires the patched Wavelet in `vendor/wavelet`, tracked as a Git 
 After cloning this repository, initialize the Wavelet checkout:
 
 ```sh
+cd mlir-to-wavelet-compiler
 git submodule update --init vendor/wavelet
 ```
 
