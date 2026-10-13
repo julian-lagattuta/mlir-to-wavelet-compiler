@@ -238,10 +238,7 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                     Rc::new(operands.1.expand_blackboxes(parent_for_loop)?),
                 ),
             }),
-            CapabilityExpr::Blackbox { value, .. } => match parent_for_loop {
-                Some(for_loop) => generate_expr(*value, Some(for_loop)),
-                None => Some(self.clone()),
-            },
+            CapabilityExpr::Blackbox { value, .. } => generate_expr(*value, parent_for_loop),
             CapabilityExpr::Constant(_) | CapabilityExpr::Variable { .. } => Some(self.clone()),
         }
     }
@@ -616,7 +613,7 @@ where
     let operation = OperationResult::try_from(value).ok()?;
     let operation = operation.owner();
 
-    let is_defined_inside_target = target_for_loop.is_some_and(|for_loop| {
+    let is_defined_inside_target = target_for_loop.is_none_or(|for_loop| {
         operation
             .block()
             .is_some_and(|block| block_is_inside_operation(block, for_loop))

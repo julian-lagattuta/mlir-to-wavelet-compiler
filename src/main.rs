@@ -14,6 +14,7 @@ mod fence_placement;
 mod program_to_wavelet;
 mod rename_variables;
 mod type_program;
+mod if_guard;
 use capabilities::print_return_expressions;
 use wavelet_elab::{Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
@@ -115,11 +116,12 @@ fn module_to_wavelet<'c>(module: Module<'c>) -> Result<Program<TypedVar>> {
     rename_program_variables(&mut program);
     
     fence_placement::place_fences(&mut program);
+    if_guard::guard_accesses(&mut program)?;
     Ok(program)
 }
 
 
-const generator: FreshWaveletNames = FreshWaveletNames::new();
+static generator: FreshWaveletNames = FreshWaveletNames::new();
 fn operation_to_wavelet<'c, 'a>(
     operation: OperationRef<'c, 'a>,
     name: &str,
