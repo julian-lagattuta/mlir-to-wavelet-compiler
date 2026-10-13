@@ -1,0 +1,3 @@
+[submodule "vendor/wavelet"]
+	path = vendor/wavelet
+	url = https://github.com/julian-lagattuta/wavelet-patched.git

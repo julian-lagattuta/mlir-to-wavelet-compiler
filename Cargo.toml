@@ -8,4 +8,4 @@ anyhow = "1"
 melior = "0.27.4"
 mlir-sys = "220.0.2"
 z3 = "0.20.2"
-wavelet-elab = {path= "/home/jl/wavelettesting/wavelet/wavelet-elab"}
+wavelet-elab = { path = "vendor/wavelet/wavelet-elab" }

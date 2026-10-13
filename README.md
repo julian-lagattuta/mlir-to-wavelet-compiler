@@ -2,6 +2,22 @@
 
 An experimental Rust compiler that translates a subset of LLVM MLIR into Wavelet source. It lowers SCF into Wavelet functions, infers array capabilities, inserts fences, and adds guards for accesses and calls whose required capabilities cannot be proved available.
 
+## Wavelet dependency
+
+This project requires the patched Wavelet in `vendor/wavelet`, tracked as a Git submodule from [wavelet-patched](https://github.com/julian-lagattuta/wavelet-patched).
+
+After cloning this repository, initialize the Wavelet checkout:
+
+```sh
+git submodule update --init vendor/wavelet
+```
+
+Cargo uses `vendor/wavelet/wavelet-elab` directly. Run the patched Wavelet compiler from the same checkout:
+
+```sh
+cargo run --manifest-path vendor/wavelet/Cargo.toml -- --help
+```
+
 
 ## Translation pipeline
 
