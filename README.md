@@ -1,7 +1,6 @@
 # LLVM MLIR Wavelet Compiler
 
-An experimental Rust compiler that translates a subset of LLVM MLIR into [Wavelet source](https://github.com/plum-umd/wavelet). It lowers SCF into Wavelet functions, infers array capabilities, inserts fences, and adds guards for accesses and calls whose required capabilities cannot be proved available.
-
+An experimental Rust compiler that translates a subset of LLVM MLIR into [Wavelet source](https://github.com/plum-umd/wavelet). It lowers SCF into Wavelet functions, infers array capabilities, and inserts fences.
 [Wavelet paper](https://lz.gy/papers/wavelet.pdf)
 
 ## Wavelet dependency
