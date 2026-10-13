@@ -1,9 +1,0 @@
-module {
-  func.func @dag(%arg0: i64, %arg1: i64) -> i64 {
-    %c5_i64 = arith.constant 5 : i64
-    %0 = arith.addi %arg0, %c5_i64 : i64
-    %1 = arith.subi %arg1, %c5_i64 : i64
-    %2 = arith.muli %0, %1 : i64
-    return %2 : i64
-  }
-}

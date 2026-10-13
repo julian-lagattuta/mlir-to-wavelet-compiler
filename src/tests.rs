@@ -1622,6 +1622,125 @@ fn call_capabilities_translate_reordered_arrays_and_scalar_parameters() {
 }
 
 #[test]
+fn callee_local_arithmetic_uses_parameters_and_keeps_disjoint_calls_unfenced() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @wrapper(%v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                %zero = arith.constant 0 : index
+                %one = arith.constant 1 : index
+                func.call @write_next(%zero, %v, %a) : (index, i32, memref<16xi32>) -> ()
+                func.call @write_next(%one, %v, %a) : (index, i32, memref<16xi32>) -> ()
+                return
+            }
+            func.func @write_next(%n: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                %one = arith.constant 1 : index
+                %next = arith.addi %n, %one : index
+                memref.store %v, %a[%next] : memref<16xi32>
+                return
+            }
+        }
+    "#).unwrap();
+    let lowered = super::module_to_wavelet(module).unwrap();
+    let wrapper = lowered.defs.iter().find(|function| function.name.0 == "wrapper").unwrap();
+    let call_results: Vec<_> = wrapper.body.stmts.iter().filter_map(|statement| {
+        match statement {
+            wavelet_elab::Stmt::LetCall { vars, .. } => Some(&vars[0].name),
+            _ => None,
+        }
+    }).collect();
+    assert_eq!(call_results.len(), 2);
+    assert_ne!(call_results[0], call_results[1]);
+    let source = super::program_to_wavelet(&lowered);
+    assert!(source.contains("#[cap(arg2: uniq @ arg0 + 1..arg0 + 2)]"));
+    assert!(!source.contains("fence!()"));
+    let parsed = wavelet_elab::parse_program(&source).unwrap();
+    let mut registry = wavelet_elab::FnRegistry::default();
+    for function in &parsed.defs {
+        registry.insert(function.clone());
+    }
+    let logic = wavelet_elab::SemanticLogic::default();
+    for function in &parsed.defs {
+        wavelet_elab::check::check_fn_with_options(
+            function, &registry, &logic, wavelet_elab::check::CheckOptions::default(),
+        ).unwrap();
+    }
+}
+
+#[test]
+fn loop_promotion_expands_arithmetic_defined_before_the_loop() {
+    use z3::{SatResult, Solver, ast::{Bool, Int}};
+
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @test(%offset: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                %zero = arith.constant 0 : index
+                %one = arith.constant 1 : index
+                %four = arith.constant 4 : index
+                %base = arith.addi %offset, %one : index
+                scf.for %i = %zero to %four step %one {
+                    %index = arith.addi %i, %base : index
+                    memref.store %v, %a[%index] : memref<16xi32>
+                }
+                return
+            }
+        }
+    "#).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let offset: Value<'_, '_> = body.argument(0).unwrap().into();
+    let map = compute_capabilities(&module).unwrap();
+    let caps = &map[&function.to_raw().ptr];
+    assert_eq!(caps.len(), 1);
+    let (start, end) = caps[0].capability_expr.as_ref().unwrap();
+    let offset = CapabilityExpr::Blackbox {
+        value: offset, signedness: wavelet_elab::ir::Signedness::Signed,
+    }.to_z3();
+    let expected_start = Int::add(&[&offset, &Int::from_i64(1)]);
+    let expected_end = Int::add(&[&offset, &Int::from_i64(4)]);
+    let solver = Solver::new();
+    solver.assert(Bool::or(&[
+        start.to_z3().eq(expected_start).not(),
+        end.to_z3().eq(expected_end).not(),
+    ]));
+    assert_eq!(solver.check(), SatResult::Unsat);
+}
+
+#[test]
+fn division_outside_loops_poisons_access_bounds() {
+    let context = test_context();
+    let module = Module::parse(&context, r#"
+        module {
+            func.func @test(%n: index, %v: i32, %a0: memref<16xi32>) {
+                %a = memref.distinct_objects %a0 : memref<16xi32>
+                %two = arith.constant 2 : index
+                %quotient = arith.divsi %n, %two : index
+                %next = arith.addi %quotient, %two : index
+                memref.store %v, %a[%next] : memref<16xi32>
+                return
+            }
+        }
+    "#).unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let store = super::util::BlockIter::new(body)
+        .find(|op| op.name().as_string_ref().as_str().unwrap() == "memref.store").unwrap();
+    let next = store.operand(2).unwrap();
+    assert!(generate_expr(next, None).is_none());
+    assert!(CapabilityExpr::Blackbox {
+        value: next, signedness: wavelet_elab::ir::Signedness::Signed,
+    }.promote(&CapabilityExpr::Constant(0), None).is_none());
+    let map = compute_capabilities(&module).unwrap();
+    let caps = &map[&function.to_raw().ptr];
+    assert_eq!(caps.len(), 1);
+    assert!(caps[0].capability_expr.is_none());
+}
+
+#[test]
 fn call_capabilities_expand_computed_arguments_into_parameters() {
     let context = test_context();
     let module = Module::parse(&context, r#"
@@ -2497,7 +2616,39 @@ fn block_capabilities_handles_flattened_2d_array_access() {
 #[test]
 fn block_capabilities_handles_nested_quadratic_access() {
     let context = test_context();
-    let module = Module::parse(&context, include_str!("../complicated_access.mlir")).unwrap();
+    let module = Module::parse(&context, r#"
+module {
+    func.func @complicated_access(%array: memref<233xi32>) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c3 = arith.constant 3 : index
+        %c4 = arith.constant 4 : index
+        %c5 = arith.constant 5 : index
+        %c7 = arith.constant 7 : index
+        %c20 = arith.constant 20 : index
+        %value = arith.constant 42 : i32
+
+        scf.for %i = %c0 to %c4 step %c1 {
+            %i_squared = arith.muli %i, %i : index
+            %outer_quadratic = arith.muli %c20, %i_squared : index
+            %outer_linear = arith.muli %c3, %i : index
+            %outer = arith.addi %outer_quadratic, %outer_linear : index
+            scf.for %j = %c0 to %c5 step %c1 {
+                %j_squared = arith.muli %j, %j : index
+                %inner_quadratic = arith.muli %c2, %j_squared : index
+                %inner = arith.addi %inner_quadratic, %j : index
+                %partial = arith.addi %outer, %inner : index
+                %index = arith.addi %partial, %c7 : index
+                memref.store %value, %array[%index] : memref<233xi32>
+                scf.yield
+            }
+            scf.yield
+        }
+        return
+    }
+}
+    "#).unwrap();
     let function = module.body().first_operation().unwrap();
     let body = function.first_region().unwrap().first_block().unwrap();
     let mut capabilities = vec![];
